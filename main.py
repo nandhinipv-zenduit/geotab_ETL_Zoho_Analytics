@@ -5,6 +5,23 @@ import json
 import smtplib
 from email.mime.text import MIMEText
 import os
+import logging
+import traceback
+
+# ===== LOGGING CONFIG =====
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.FileHandler(f"{LOG_DIR}/etl.log"),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
 
 # ===== GEOTAB CONFIG =====
 MYADMIN_URL = "https://myadminapi.geotab.com/v2/MyAdminApi.ashx"
@@ -123,9 +140,9 @@ def _zoho_import_chunk(csv_bytes, import_type, access_token):
     data = {"CONFIG": json.dumps(config)}
 
     r = requests.post(url, headers=headers, data=data, files=files, timeout=300)
-    print(f"  [{import_type}] status: {r.status_code}")
+    logger.info(f"  [{import_type}] status: {r.status_code}")
     if r.status_code != 200:
-        print("  response:", r.text)
+        logger.error(f"Zoho response error: {r.text}")
     r.raise_for_status()
     return r.json()
 
@@ -144,7 +161,7 @@ def zoho_truncate_add(df, access_token):
 
     total_rows = len(df)
     n_chunks = (total_rows + rows_per_chunk - 1) // rows_per_chunk
-    print(f"Uploading {total_rows} rows in {n_chunks} chunk(s) of ~{rows_per_chunk} rows...")
+    logger.info(f"Uploading {total_rows} rows in {n_chunks} chunk(s) of ~{rows_per_chunk} rows...")
 
     imported = 0
     for i in range(0, total_rows, rows_per_chunk):
@@ -156,10 +173,10 @@ def zoho_truncate_add(df, access_token):
         summary = result.get("data", {}).get("importSummary", {})
         added = summary.get("totalRowCount", summary.get("successRowCount", len(chunk)))
         imported += len(chunk)
-        print(f"  chunk {i // rows_per_chunk + 1}/{n_chunks}: sent {len(chunk)} rows "
+        logger.info(f"  chunk {i // rows_per_chunk + 1}/{n_chunks}: sent {len(chunk)} rows "
               f"(Zoho reported {added}) | cumulative {imported}/{total_rows}")
 
-    print(f"Zoho sync complete: {imported} rows loaded into the table.")
+    logger.info(f"Zoho sync complete: {imported} rows loaded into the table.")
 
 
 # ===== MAIN =====
@@ -176,21 +193,21 @@ def main():
 
     all_records = []
     for acc in accounts:
-        print(f"Fetching devices for account {acc}...")
+        logger.info(f"Fetching devices for account {acc}...")
         try:
             raw = get_device_contracts_for_account(acc, creds)
         except Exception as e:
-            print(f"Error fetching for {acc}: {e}")
+            logger.info(f"Error fetching for {acc}: {e}")
             raw = []
         recs = extract_records(raw, acc)
-        print(f"Got {len(recs)} records for {acc}")
+        logger.info(f"Got {len(recs)} records for {acc}")
         all_records.extend(recs)
 
     df = pd.DataFrame(all_records)
 
     # Guard: never wipe the Zoho table if the fetch came back empty
     if df.empty:
-        print("No records fetched - skipping Zoho sync to avoid wiping the table.")
+        logger.info("No records fetched - skipping Zoho sync to avoid wiping the table.")
         return
 
     # ===== ZOHO SYNC =====
@@ -204,9 +221,9 @@ def main():
         index=False
     )
 
-    print("Saved CSV & Excel successfully")
-    print("Columns:", len(df.columns))
-    print(df.head())
+    logger.info("Saved CSV & Excel successfully")
+    logger.info(f"Columns: {len(df.columns)}")
+    logger.info(f"\n{df.head()}")
 
 def send_failure_email(error_msg: str):
     sender = "nandhinipv@zenduit.com"   # change if needed
@@ -233,12 +250,13 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        error_text = str(e)
-        print("ETL FAILED:", error_text)
+        logger.error("ETL FAILED")
+        logger.error(str(e))
+        logger.error(traceback.format_exc())
 
         try:
-            send_failure_email(error_text)
+            send_failure_email(str(e))
         except Exception as mail_err:
-            print("Failed to send email:", mail_err)
+            logger.error(f"Failed to send email: {mail_err}")
 
-        raise  # keep failure visible in logs
+        raise
