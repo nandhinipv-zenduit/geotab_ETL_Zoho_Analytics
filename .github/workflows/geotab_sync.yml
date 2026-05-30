@@ -1,0 +1,51 @@
+name: Geotab Zoho ETL Sync
+
+concurrency:
+  group: geotab-etl
+  cancel-in-progress: false
+
+on:
+  schedule:
+    - cron: "0 15 * * *"  # 10 AM EST
+    - cron: "0 18 * * *"  # +3 hours
+    - cron: "0 21 * * *"
+    - cron: "0 0 * * *"
+    - cron: "0 3 * * *"
+    - cron: "0 6 * * *"
+    - cron: "0 9 * * *"
+
+  workflow_dispatch:
+
+jobs:
+  run-etl:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ETL script
+        env:
+          GEOTAB_USERNAME: ${{ secrets.GEOTAB_USERNAME }}
+          GEOTAB_PASSWORD: ${{ secrets.GEOTAB_PASSWORD }}
+
+          ZOHO_CLIENT_ID_UNI: ${{ secrets.ZOHO_CLIENT_ID_UNI }}
+          ZOHO_CLIENT_SECRET_UNI: ${{ secrets.ZOHO_CLIENT_SECRET_UNI }}
+          ZOHO_REFRESH_TOKEN_UNI: ${{ secrets.ZOHO_REFRESH_TOKEN_UNI }}
+
+        run: python main.py
+
+      - name: Upload logs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: geotab-etl-logs
+          path: logs/
