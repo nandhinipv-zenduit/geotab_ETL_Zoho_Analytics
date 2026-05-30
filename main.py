@@ -2,6 +2,8 @@ import requests
 import pandas as pd
 from datetime import datetime, timezone
 import json
+import smtplib
+from email.mime.text import MIMEText
 import os
 
 # ===== GEOTAB CONFIG =====
@@ -206,6 +208,37 @@ def main():
     print("Columns:", len(df.columns))
     print(df.head())
 
+def send_failure_email(error_msg: str):
+    sender = "nandhinipv@zenduit.com"   # change if needed
+    receiver = "nandhinipv@zenduit.com"
+    app_password = os.getenv("gmail_pass")
+
+    msg = MIMEText(f"""
+ETL FAILED ❌
+
+Time: {datetime.now().isoformat()}
+
+Error:
+{error_msg}
+""")
+
+    msg["Subject"] = "Geotab ETL Failed"
+    msg["From"] = sender
+    msg["To"] = receiver
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(sender, app_password)
+        server.send_message(msg)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        error_text = str(e)
+        print("ETL FAILED:", error_text)
+
+        try:
+            send_failure_email(error_text)
+        except Exception as mail_err:
+            print("Failed to send email:", mail_err)
+
+        raise  # keep failure visible in logs
