@@ -128,10 +128,17 @@ def _serial_of(record):
     return None
 
 def find_serials_missing_database(df):
-    """Return serials whose LatestDeviceDatabase_* columns are all blank."""
-    db_cols = [c for c in df.columns if c.startswith(DB_COL_PREFIX)]
-    serial_col = next((c for c in ("Device_SerialNumber", "SerialNumber", "Device_serialNumber")
-                       if c in df.columns), None)
+    """Return serials whose latest-device-database columns are all blank.
+
+    Column matching is case-insensitive because the JSON-RPC endpoint returns
+    camelCase keys (e.g. latestDeviceDatabase_databaseName), not the PascalCase
+    shown in the Geotab docs.
+    """
+    db_cols = [c for c in df.columns if c.lower().startswith(DB_COL_PREFIX.lower())]
+    lower_map = {c.lower(): c for c in df.columns}
+    serial_col = next((lower_map[k] for k in
+                       ("device_serialnumber", "serialnumber", "device_serialno", "serialno")
+                       if k in lower_map), None)
     if not serial_col:
         logger.warning("No serial-number column found; cannot backfill databases.")
         return [], None, db_cols
@@ -180,15 +187,17 @@ def backfill_missing_databases(df, creds):
     for c in ("OwnerDatabaseName", "SharedDatabaseName"):
         if c not in df.columns:
             df[c] = pd.NA
-    primary_col = f"{DB_COL_PREFIX}_DatabaseName"  # main "database" column from Pass 1
+    # Main "database" column from Pass 1 (whatever its actual casing is).
+    primary_col = next((c for c in db_cols if c.lower().endswith("databasename")), None)
 
     filled = 0
     for rec in fetched:
-        serial = rec.get("SerialNo")
+        # Endpoint returns camelCase keys; fall back to PascalCase just in case.
+        serial = rec.get("serialNo") or rec.get("SerialNo")
         if not serial:
             continue
-        owner = rec.get("OwnerDatabaseName")
-        shared = rec.get("SharedDatabaseName")
+        owner = rec.get("ownerDatabaseName") or rec.get("OwnerDatabaseName")
+        shared = rec.get("sharedDatabaseName") or rec.get("SharedDatabaseName")
         mask = df[serial_col] == serial
         if not mask.any():
             continue
