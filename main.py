@@ -73,27 +73,26 @@ def get_device_contracts_for_account(account_id, creds):
     }
     return call_api("GetDeviceContracts", params)
 
-def get_device_contracts_by_serials(serials, creds,
-                                    from_date="2015-01-01T00:00:00Z"):
+def get_device_databases_by_serials(serials, creds):
     """
-    PASS 2: look up specific devices directly by serial number.
+    PASS 2: get the OWNER (primary) and SHARED database names for specific serials.
 
-    Uses the GetDeviceContracts `serialNos` filter so shared / not-yet-databased
-    devices that don't surface in the per-account pull can still be fetched.
-    Date range is opened wide (not today-only) so the contract is always caught.
+    Why not GetDeviceContracts here: its LatestDeviceDatabase field is the most
+    recent database the device was *detected/communicated* in. Devices that have
+    never connected (no first-connect date, no GPS/comm records) have no such
+    record, so that field is blank -- and re-fetching the contract won't change
+    that. The administrative "Primary database" shown in MyAdmin comes from
+    GetDeviceDatabaseNamesAsync instead, which returns OwnerDatabaseName +
+    SharedDatabaseName per serial regardless of whether the device has connected.
     """
     if not serials:
         return []
     params = {
         "apiKey": creds["userId"],
         "sessionId": creds["sessionId"],
-        "userCompanyId": -1,
-        "devicePlanId": -1,
-        "serialNos": list(serials),
-        "fromDate": from_date,
-        "toDate": datetime.now(timezone.utc).strftime("%Y-%m-%dT23:59:59Z"),
+        "serialNumbers": list(serials),
     }
-    return call_api("GetDeviceContracts", params)
+    return call_api("GetDeviceDatabaseNamesAsync", params)
 
 def flatten_dict(d, parent_key="", sep="_"):
     items = []
@@ -148,58 +147,63 @@ def find_serials_missing_database(df):
     return serials, serial_col, db_cols
 
 def backfill_missing_databases(df, creds):
-    """PASS 2 orchestration: re-fetch missing-database serials and copy the DB value back in."""
+    """
+    PASS 2 orchestration: for serials whose database came back blank in Pass 1,
+    look up the administrative owner/shared database via GetDeviceDatabaseNamesAsync
+    and write it back in. Adds OwnerDatabaseName / SharedDatabaseName columns and
+    also fills the main database column (LatestDeviceDatabase_DatabaseName) so the
+    primary database is populated even for devices that have never communicated.
+    """
     serials, serial_col, db_cols = find_serials_missing_database(df)
     if not serials:
         logger.info("No devices with a missing database - nothing to backfill.")
         return df
-    logger.info(f"{len(serials)} device(s) missing a database; re-fetching by serial: {serials}")
+    logger.info(f"{len(serials)} device(s) missing a database; looking up owner/shared DBs: {serials}")
 
-    # Fetch in batches to respect the API and keep payloads reasonable.
+    # GetDeviceDatabaseNamesAsync takes an array of serials; batch to keep payloads sane.
     BATCH = 100
-    refetched = []
+    fetched = []
     for i in range(0, len(serials), BATCH):
         batch = serials[i:i + BATCH]
         try:
-            raw = get_device_contracts_by_serials(batch, creds)
+            raw = get_device_databases_by_serials(batch, creds)
         except Exception as e:
-            logger.error(f"Serial re-fetch failed for batch {batch}: {e}")
+            logger.error(f"Database lookup failed for batch {batch}: {e}")
             raw = []
-        refetched.extend(r for r in (raw or []) if isinstance(r, dict))
+        fetched.extend(r for r in (raw or []) if isinstance(r, dict))
 
-    if not refetched:
-        logger.warning("Serial re-fetch returned nothing; leaving databases blank.")
+    if not fetched:
+        logger.warning("Database lookup returned nothing; leaving databases blank.")
         return df
 
-    # Build serial -> {db column: value} from the re-fetched records.
-    fill = {}
-    for rec in refetched:
-        flat = flatten_dict(rec)
-        serial = _serial_of(flat)
-        if not serial:
-            continue
-        db_values = {c: flat[c] for c in flat if c.startswith(DB_COL_PREFIX)}
-        if db_values:
-            fill[serial] = db_values
-
-    if not fill:
-        logger.warning("Re-fetched records had no database info; leaving databases blank.")
-        return df
-
-    # Make sure every db column we discovered exists in df, then copy values in.
-    all_db_cols = set(db_cols) | {c for v in fill.values() for c in v}
-    for c in all_db_cols:
+    # Ensure the destination columns exist.
+    for c in ("OwnerDatabaseName", "SharedDatabaseName"):
         if c not in df.columns:
             df[c] = pd.NA
+    primary_col = f"{DB_COL_PREFIX}_DatabaseName"  # main "database" column from Pass 1
 
     filled = 0
-    for serial, db_values in fill.items():
+    for rec in fetched:
+        serial = rec.get("SerialNo")
+        if not serial:
+            continue
+        owner = rec.get("OwnerDatabaseName")
+        shared = rec.get("SharedDatabaseName")
         mask = df[serial_col] == serial
-        if mask.any():
-            for c, val in db_values.items():
-                df.loc[mask, c] = val
-            filled += int(mask.sum())
-    logger.info(f"Backfilled database info for {filled} row(s) across {len(fill)} serial(s).")
+        if not mask.any():
+            continue
+        df.loc[mask, "OwnerDatabaseName"] = owner
+        df.loc[mask, "SharedDatabaseName"] = shared
+        # Backfill the main database column where it's still blank, using the owner DB.
+        if primary_col in df.columns and owner:
+            blank = mask & (
+                df[primary_col].isna() | (df[primary_col].astype(str).str.strip() == "")
+            )
+            df.loc[blank, primary_col] = owner
+        filled += int(mask.sum())
+
+    logger.info(f"Backfilled owner/shared database for {filled} row(s) "
+                f"from {len(fetched)} lookup record(s).")
     return df
 
 # ===== ZOHO ANALYTICS v2 FUNCTIONS =====
