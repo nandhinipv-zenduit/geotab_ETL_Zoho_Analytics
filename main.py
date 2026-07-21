@@ -40,9 +40,11 @@ ZOHO_WORKSPACE_ID = "953790000013364003"
 ZOHO_VIEW_ID = "953790000054827102"   # "Geotab Devices" table
 
 # ===== GEOTAB API HELPER =====
-def call_api(method, params):
+def call_api(method, params, timeout=120):
     payload = {"method": method, "params": params}
-    resp = requests.post(MYADMIN_URL, data={"JSON-RPC": json.dumps(payload)})
+    # Always pass a timeout: without one a stalled connection blocks forever
+    # (this is what made the job hang on "Fetching devices for account ...").
+    resp = requests.post(MYADMIN_URL, data={"JSON-RPC": json.dumps(payload)}, timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
     if "error" in data and data["error"]:
@@ -63,7 +65,9 @@ def get_device_contracts_for_account(account_id, creds):
         "forAccount": account_id,
         "userCompanyId": -1,
         "devicePlanId": -1,
-        "includeConnectInfo": True,
+        # NOTE: includeConnectInfo is intentionally OFF here. Turning it on makes
+        # Geotab attach connection/GPS data for every device, which turns the
+        # large-account pull (e.g. GOFL02) into a huge, slow response.
         "fromDate": datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z"),
         "toDate": datetime.now(timezone.utc).strftime("%Y-%m-%dT23:59:59Z")
     }
@@ -85,7 +89,6 @@ def get_device_contracts_by_serials(serials, creds,
         "sessionId": creds["sessionId"],
         "userCompanyId": -1,
         "devicePlanId": -1,
-        "includeConnectInfo": True,
         "serialNos": list(serials),
         "fromDate": from_date,
         "toDate": datetime.now(timezone.utc).strftime("%Y-%m-%dT23:59:59Z"),
