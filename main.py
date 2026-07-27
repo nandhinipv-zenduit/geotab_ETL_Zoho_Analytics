@@ -58,7 +58,13 @@ def authenticate():
     })
 
 def get_device_contracts_for_account(account_id, creds):
-    """PASS 1: pull every device contract for an account (full details)."""
+    """PASS 1: pull every device contract for an account (full details).
+
+    ApiDeviceContract already includes ActiveDevicePlan, IsTerminated and
+    IsUnactivated by default (no extra flag or optionalParam schema needed),
+    so this single call is also where "active billing plan" and "billing
+    status" come from -- see add_billing_status() below.
+    """
     params = {
         "apiKey": creds["userId"],
         "sessionId": creds["sessionId"],
@@ -67,7 +73,9 @@ def get_device_contracts_for_account(account_id, creds):
         "devicePlanId": -1,
         # NOTE: includeConnectInfo is intentionally OFF here. Turning it on makes
         # Geotab attach connection/GPS data for every device, which turns the
-        # large-account pull (e.g. GOFL02) into a huge, slow response.
+        # large-account pull (e.g. GOFL02) into a huge, slow response. This flag
+        # only affects connection/GPS data -- it has no effect on ActiveDevicePlan,
+        # IsTerminated, or IsUnactivated, so billing status is unaffected.
         "fromDate": datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z"),
         "toDate": datetime.now(timezone.utc).strftime("%Y-%m-%dT23:59:59Z")
     }
@@ -215,6 +223,66 @@ def backfill_missing_databases(df, creds):
                 f"from {len(fetched)} lookup record(s).")
     return df
 
+# ===== BILLING STATUS / ACTIVE PLAN HELPERS =====
+# ApiDeviceContract does NOT expose a single "BillingStatus" field. What MyAdmin's
+# own UI shows as "Billing Status" (Active / Suspended / Terminated / Never
+# Activated) is derived from a few underlying fields that GetDeviceContracts
+# already returns:
+#   - ActiveDevicePlan.Name  -> the active billing plan (e.g. "Base 60", "Pro",
+#                                or a suspend-type plan like "Seasonal Standby")
+#   - IsTerminated           -> True once the contract has been terminated
+#   - IsUnactivated          -> True if the device has never activated
+# There is no separate boolean for "suspended" -- a suspended device is one
+# whose ActiveDevicePlan is a suspend/seasonal-standby plan. Column matching
+# below is case-insensitive because the JSON-RPC endpoint returns camelCase
+# keys (isTerminated, activeDevicePlan_name, ...), not the PascalCase used in
+# the Geotab docs.
+
+# If your account's suspend-type plan(s) are named differently, add the
+# matching keyword(s) here (check the "Active Billing Plan" column output,
+# or MyAdmin > Device Admin > Billing Status, to confirm the exact plan name).
+SUSPENDED_PLAN_KEYWORDS = ("suspend", "seasonal", "standby")
+
+def _find_col(df, *candidates):
+    lower_map = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand.lower() in lower_map:
+            return lower_map[cand.lower()]
+    return None
+
+def _is_true(val):
+    return str(val).strip().lower() == "true"
+
+def add_billing_status(df):
+    """Adds 'Active Billing Plan' and 'Billing Status' columns, derived from
+    ActiveDevicePlan / IsTerminated / IsUnactivated (see note above)."""
+    plan_name_col = _find_col(df, "ActiveDevicePlan_Name")
+    terminated_col = _find_col(df, "IsTerminated")
+    unactivated_col = _find_col(df, "IsUnactivated")
+
+    if not plan_name_col:
+        logger.warning("No ActiveDevicePlan_Name column found; "
+                        "'Active Billing Plan' will be blank.")
+    if not terminated_col or not unactivated_col:
+        logger.warning("IsTerminated/IsUnactivated column(s) missing; "
+                        "'Billing Status' may be incomplete.")
+
+    df["Active Billing Plan"] = df[plan_name_col] if plan_name_col else pd.NA
+
+    def status_row(row):
+        if terminated_col and _is_true(row.get(terminated_col)):
+            return "Terminated"
+        if unactivated_col and _is_true(row.get(unactivated_col)):
+            return "Never Activated"
+        plan_name = str(row.get(plan_name_col, "") or "") if plan_name_col else ""
+        if any(k in plan_name.lower() for k in SUSPENDED_PLAN_KEYWORDS):
+            return "Suspended"
+        return "Active"
+
+    df["Billing Status"] = df.apply(status_row, axis=1)
+    logger.info("Billing Status breakdown:\n%s", df["Billing Status"].value_counts().to_string())
+    return df
+
 # ===== ZOHO ANALYTICS v2 FUNCTIONS =====
 def zoho_get_access_token():
     """Exchange the long-lived refresh token for a 1-hour access token."""
@@ -317,6 +385,9 @@ def main():
 
     # ===== PASS 2: fill in databases for serials the per-account pull missed =====
     df = backfill_missing_databases(df, creds)
+
+    # ===== BILLING STATUS / ACTIVE BILLING PLAN =====
+    df = add_billing_status(df)
 
     # ===== ZOHO SYNC =====
     token = zoho_get_access_token()
