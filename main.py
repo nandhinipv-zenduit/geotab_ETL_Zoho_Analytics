@@ -224,24 +224,44 @@ def backfill_missing_databases(df, creds):
     return df
 
 # ===== BILLING STATUS / ACTIVE PLAN HELPERS =====
-# ApiDeviceContract does NOT expose a single "BillingStatus" field. What MyAdmin's
-# own UI shows as "Billing Status" (Active / Suspended / Terminated / Never
-# Activated) is derived from a few underlying fields that GetDeviceContracts
-# already returns:
-#   - ActiveDevicePlan.Name  -> the active billing plan (e.g. "Base 60", "Pro",
-#                                or a suspend-type plan like "Seasonal Standby")
-#   - IsTerminated           -> True once the contract has been terminated
-#   - IsUnactivated          -> True if the device has never activated
-# There is no separate boolean for "suspended" -- a suspended device is one
-# whose ActiveDevicePlan is a suspend/seasonal-standby plan. Column matching
-# below is case-insensitive because the JSON-RPC endpoint returns camelCase
-# keys (isTerminated, activeDevicePlan_name, ...), not the PascalCase used in
-# the Geotab docs.
+# ApiDeviceContract does NOT expose single "BillingStatus" / "ActiveBillingPlan"
+# fields that match MyAdmin's UI verbatim. Reverse-engineered from MyAdmin's own
+# Device Management grid (confirmed against real sample rows):
+#
+#   MyAdmin "Billing status"     MyAdmin "Active billing plan"
+#   ---------------------------  --------------------------------
+#   TERMINATED                   TERMINATED
+#   Never billed                 NEVER ACTIVATED
+#   Active                       "{ActiveDevicePlan.Name}: {rate plan type}"
+#                                 e.g. "GO: Live", or with add-ons:
+#                                 "GO: Live, ProPlus Mode-Live"
+#
+# The "Active billing plan" text for an active device is built from two
+# fields GetDeviceContracts already returns:
+#   - ActiveDevicePlan.Name         -> e.g. "GO"
+#   - ActiveRatePlans[].ratePlan    -> each has ratePlanName (e.g. "GO Plan",
+#                                      "ProPlus Mode Plan") and
+#                                      ratePlanType.name (e.g. "Live")
+# The first rate plan is shown as "{ActiveDevicePlan.Name}: {type}"; any
+# additional simultaneously-active rate plans (add-ons) are appended as
+# "{rate plan name minus the word 'Plan'}-{type}", comma-separated. This was
+# validated against multi-plan examples ("GO: Live, ProPlus Mode-Live" and
+# "GO: Live, GO-Live") and matched exactly.
+#
+# CAVEAT: there's no confirmed sample for a *Suspended* device in what we've
+# seen so far, so that branch below is still a best-effort guess based on
+# plan-name keywords -- verify it against MyAdmin for any suspended/seasonal
+# devices in your account and adjust SUSPENDED_PLAN_KEYWORDS if needed.
+#
+# Column matching is case-insensitive because the JSON-RPC endpoint returns
+# camelCase keys (isTerminated, activeDevicePlan_name, activeRatePlans, ...),
+# not the PascalCase used in the Geotab docs.
 
-# If your account's suspend-type plan(s) are named differently, add the
-# matching keyword(s) here (check the "Active Billing Plan" column output,
-# or MyAdmin > Device Admin > Billing Status, to confirm the exact plan name).
-SUSPENDED_PLAN_KEYWORDS = ("suspend", "seasonal", "standby")
+STATUS_TERMINATED = "TERMINATED"
+STATUS_NEVER_BILLED = "Never billed"           # MyAdmin "Billing status" wording
+PLAN_NEVER_ACTIVATED = "NEVER ACTIVATED"       # MyAdmin "Active billing plan" wording
+STATUS_ACTIVE = "Active"
+SUSPENDED_PLAN_KEYWORDS = ("suspend", "seasonal", "standby")  # unverified, see caveat above
 
 def _find_col(df, *candidates):
     lower_map = {c.lower(): c for c in df.columns}
@@ -253,33 +273,74 @@ def _find_col(df, *candidates):
 def _is_true(val):
     return str(val).strip().lower() == "true"
 
+def _parse_rate_plans(raw):
+    """activeRatePlans comes through flatten_dict as a JSON string (lists are
+    json.dumps'd). Parse it back into a list of dicts."""
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)) or raw == "":
+        return []
+    if isinstance(raw, list):
+        return raw
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, list) else []
+    except (TypeError, ValueError):
+        return []
+
+def _strip_plan_word(name):
+    name = (name or "").strip()
+    if name.lower().endswith(" plan"):
+        name = name[: -len(" plan")]
+    return name.strip()
+
+def _format_active_plan(plan_name, rate_plans):
+    """Reconstructs MyAdmin's 'Active billing plan' text for an active device."""
+    if not rate_plans:
+        return plan_name or pd.NA
+    parts = []
+    for i, entry in enumerate(rate_plans):
+        rp = (entry or {}).get("ratePlan", {}) or {}
+        rp_type = (rp.get("ratePlanType") or {}).get("name") or ""
+        rp_name = _strip_plan_word(rp.get("ratePlanName"))
+        if i == 0:
+            label = plan_name or rp_name
+            parts.append(f"{label}: {rp_type}" if rp_type else label)
+        else:
+            parts.append(f"{rp_name}-{rp_type}" if rp_type else rp_name)
+    return ", ".join(p for p in parts if p)
+
 def add_billing_status(df):
-    """Adds 'Active Billing Plan' and 'Billing Status' columns, derived from
-    ActiveDevicePlan / IsTerminated / IsUnactivated (see note above)."""
+    """Adds 'Billing Status' and 'Active Billing Plan' columns matching
+    MyAdmin's Device Management grid wording (see note above)."""
     plan_name_col = _find_col(df, "ActiveDevicePlan_Name")
     terminated_col = _find_col(df, "IsTerminated")
     unactivated_col = _find_col(df, "IsUnactivated")
+    rate_plans_col = _find_col(df, "ActiveRatePlans")
 
     if not plan_name_col:
         logger.warning("No ActiveDevicePlan_Name column found; "
-                        "'Active Billing Plan' will be blank.")
+                        "'Active Billing Plan' will be incomplete.")
     if not terminated_col or not unactivated_col:
         logger.warning("IsTerminated/IsUnactivated column(s) missing; "
                         "'Billing Status' may be incomplete.")
 
-    df["Active Billing Plan"] = df[plan_name_col] if plan_name_col else pd.NA
-
-    def status_row(row):
+    def compute(row):
         if terminated_col and _is_true(row.get(terminated_col)):
-            return "Terminated"
+            return STATUS_TERMINATED, STATUS_TERMINATED
         if unactivated_col and _is_true(row.get(unactivated_col)):
-            return "Never Activated"
-        plan_name = str(row.get(plan_name_col, "") or "") if plan_name_col else ""
-        if any(k in plan_name.lower() for k in SUSPENDED_PLAN_KEYWORDS):
-            return "Suspended"
-        return "Active"
+            return STATUS_NEVER_BILLED, PLAN_NEVER_ACTIVATED
 
-    df["Billing Status"] = df.apply(status_row, axis=1)
+        plan_name = row.get(plan_name_col) if plan_name_col else None
+        rate_plans = _parse_rate_plans(row.get(rate_plans_col)) if rate_plans_col else []
+        plan_display = _format_active_plan(plan_name, rate_plans)
+
+        status = STATUS_ACTIVE
+        if any(k in str(plan_name or "").lower() for k in SUSPENDED_PLAN_KEYWORDS):
+            status = "Suspended"  # unverified wording, see caveat above
+        return status, plan_display
+
+    results = df.apply(compute, axis=1, result_type="expand")
+    df["Billing Status"] = results[0]
+    df["Active Billing Plan"] = results[1]
     logger.info("Billing Status breakdown:\n%s", df["Billing Status"].value_counts().to_string())
     return df
 
