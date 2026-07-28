@@ -63,7 +63,9 @@ def get_device_contracts_for_account(account_id, creds):
     ApiDeviceContract already includes ActiveDevicePlan, IsTerminated and
     IsUnactivated by default (no extra flag or optionalParam schema needed),
     so this single call is also where "active billing plan" and "billing
-    status" come from -- see add_billing_status() below.
+    status" come from -- see add_billing_status() below. It also nests the
+    ApiGeotabDevice under "Device", which is where Hardware ID comes from --
+    see add_hardware_id() below.
     """
     params = {
         "apiKey": creds["userId"],
@@ -344,6 +346,50 @@ def add_billing_status(df):
     logger.info("Billing Status breakdown:\n%s", df["Billing Status"].value_counts().to_string())
     return df
 
+# ===== HARDWARE ID / PRODUCT CODE HELPERS =====
+# MyAdmin's Device Management grid shows "Hardware ID" and "Product code" as
+# two SEPARATE columns (confirmed against a real row: Hardware ID "571024830",
+# Product code "GP9LTEATT" -- they are not the same value).
+#
+#   - "Product code"  -> ApiDeviceContract.ProductCode (a top-level field on
+#                         the contract, e.g. the GO9-LTE-ATT hardware/SKU code).
+#   - "Hardware ID"    -> ApiGeotabDevice.Id, i.e. the nested Device object's
+#                         "Id" property. Geotab's docs describe this as simply
+#                         "Database Id of the device," and a 9-digit numeric
+#                         value like 571024830 matches that shape. This is
+#                         distinct from Device.SerialNumber (the human-facing
+#                         serial, e.g. "G9X4SS9TAFX5").
+#
+# Column matching is case-insensitive because the JSON-RPC endpoint returns
+# camelCase keys (device_id / deviceId), not the PascalCase used in the docs.
+HARDWARE_ID_CANDIDATES = ("Device_Id", "Device_id", "HardwareId", "HwId")
+PRODUCT_CODE_CANDIDATES = ("ProductCode",)
+
+def add_hardware_id(df):
+    """Adds a clean 'Hardware ID' column (from Device.Id) and a clean
+    'Product code' column (from ApiDeviceContract.ProductCode), matching
+    MyAdmin's Device Management grid."""
+    hw_col = _find_col(df, *HARDWARE_ID_CANDIDATES)
+    if hw_col:
+        df["Hardware ID"] = df[hw_col]
+        logger.info(f"Hardware ID sourced from column '{hw_col}'.")
+    else:
+        df["Hardware ID"] = pd.NA
+        logger.warning(
+            "No Hardware ID column found among candidates %s. "
+            "Available columns: %s. If Device.Id is present under a "
+            "different key, add it to HARDWARE_ID_CANDIDATES.",
+            HARDWARE_ID_CANDIDATES, list(df.columns)
+        )
+
+    pc_col = _find_col(df, *PRODUCT_CODE_CANDIDATES)
+    if pc_col and pc_col != "Product code":
+        df["Product code"] = df[pc_col]
+    elif not pc_col:
+        logger.warning("No Product code column found among candidates %s.",
+                        PRODUCT_CODE_CANDIDATES)
+    return df
+
 # ===== ZOHO ANALYTICS v2 FUNCTIONS =====
 def zoho_get_access_token():
     """Exchange the long-lived refresh token for a 1-hour access token."""
@@ -449,6 +495,9 @@ def main():
 
     # ===== BILLING STATUS / ACTIVE BILLING PLAN =====
     df = add_billing_status(df)
+
+    # ===== HARDWARE ID / PRODUCT CODE =====
+    df = add_hardware_id(df)
 
     # ===== ZOHO SYNC =====
     token = zoho_get_access_token()
