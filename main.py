@@ -390,6 +390,50 @@ def add_hardware_id(df):
                         PRODUCT_CODE_CANDIDATES)
     return df
 
+# ===== CONTRACT DATES =====
+# Confirmed directly from a live GetDeviceContracts response: "contractStartDate"
+# and "contractEndDate" are top-level scalar fields on the contract (siblings of
+# productCode, isTerminated, etc.) -- NOT the same as the more generic "startDate"
+# / "endDate" fields also present on the same object (those track something else,
+# e.g. the sample device had endDate "2050-01-01..." (effectively "no end") but a
+# real 3-year contractEndDate), nor "billingStartDate". Since contractStartDate/
+# contractEndDate are top-level scalars, flatten_dict leaves them unprefixed, e.g.
+# "contractStartDate" (camelCase, straight from the JSON-RPC response).
+CONTRACT_START_CANDIDATES = ("contractStartDate",)
+CONTRACT_END_CANDIDATES = ("contractEndDate",)
+
+def add_contract_dates(df):
+    """Adds clean 'Contract Start Date' / 'Contract End Date' columns.
+
+    Parsed into real (timezone-naive) datetimes so they land as actual dates
+    in Excel/Zoho rather than raw ISO-8601 text. Tz-naive is deliberate:
+    df.to_excel() raises on timezone-aware datetimes, and the source strings
+    are already UTC ('...Z' suffix), so the tz is dropped only after
+    normalizing to UTC -- the values themselves aren't shifted.
+    """
+    start_col = _find_col(df, *CONTRACT_START_CANDIDATES)
+    end_col = _find_col(df, *CONTRACT_END_CANDIDATES)
+
+    if start_col:
+        df["Contract Start Date"] = pd.to_datetime(
+            df[start_col], errors="coerce", utc=True
+        ).dt.tz_localize(None)
+    else:
+        df["Contract Start Date"] = pd.NA
+        logger.warning("No Contract Start Date column found among candidates %s.",
+                        CONTRACT_START_CANDIDATES)
+
+    if end_col:
+        df["Contract End Date"] = pd.to_datetime(
+            df[end_col], errors="coerce", utc=True
+        ).dt.tz_localize(None)
+    else:
+        df["Contract End Date"] = pd.NA
+        logger.warning("No Contract End Date column found among candidates %s.",
+                        CONTRACT_END_CANDIDATES)
+
+    return df
+
 # ===== ZOHO ANALYTICS v2 FUNCTIONS =====
 def zoho_get_access_token():
     """Exchange the long-lived refresh token for a 1-hour access token."""
@@ -498,6 +542,9 @@ def main():
 
     # ===== HARDWARE ID / PRODUCT CODE =====
     df = add_hardware_id(df)
+
+    # ===== CONTRACT START / END DATE =====
+    df = add_contract_dates(df)
 
     # ===== ZOHO SYNC =====
     token = zoho_get_access_token()
