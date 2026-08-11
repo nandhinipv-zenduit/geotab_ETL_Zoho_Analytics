@@ -7,7 +7,6 @@ from email.mime.text import MIMEText
 import os
 import logging
 import traceback
-
 # ===== LOGGING CONFIG =====
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -20,12 +19,10 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
 # ===== GEOTAB CONFIG =====
 MYADMIN_URL = "https://myadminapi.geotab.com/v2/MyAdminApi.ashx"
 USERNAME = os.getenv("GEOTAB_USERNAME")
 PASSWORD = os.getenv("GEOTAB_PASSWORD")
-
 # ===== ZOHO ANALYTICS CONFIG (v2 OAuth) =====
 # US data center. If your account is on .eu / .in / .com.au, change accounts_url + api_domain.
 ZOHO_ANALYTICS = {
@@ -38,7 +35,6 @@ ZOHO_ANALYTICS = {
 ZOHO_ORG_ID = "67409019"
 ZOHO_WORKSPACE_ID = "953790000013364003"
 ZOHO_VIEW_ID = "953790000054827102"   # "Geotab Devices" table
-
 # ===== GEOTAB API HELPER =====
 def call_api(method, params, timeout=120):
     payload = {"method": method, "params": params}
@@ -50,16 +46,13 @@ def call_api(method, params, timeout=120):
     if "error" in data and data["error"]:
         raise Exception(data["error"])
     return data.get("result")
-
 def authenticate():
     return call_api("Authenticate", {
         "username": USERNAME,
         "password": PASSWORD
     })
-
 def get_device_contracts_for_account(account_id, creds):
     """PASS 1: pull every device contract for an account (full details).
-
     ApiDeviceContract already includes ActiveDevicePlan, IsTerminated and
     IsUnactivated by default (no extra flag or optionalParam schema needed),
     so this single call is also where "active billing plan" and "billing
@@ -82,11 +75,9 @@ def get_device_contracts_for_account(account_id, creds):
         "toDate": datetime.now(timezone.utc).strftime("%Y-%m-%dT23:59:59Z")
     }
     return call_api("GetDeviceContracts", params)
-
 def get_device_databases_by_serials(serials, creds):
     """
     PASS 2: get the OWNER (primary) and SHARED database names for specific serials.
-
     Why not GetDeviceContracts here: its LatestDeviceDatabase field is the most
     recent database the device was *detected/communicated* in. Devices that have
     never connected (no first-connect date, no GPS/comm records) have no such
@@ -94,6 +85,14 @@ def get_device_databases_by_serials(serials, creds):
     that. The administrative "Primary database" shown in MyAdmin comes from
     GetDeviceDatabaseNamesAsync instead, which returns OwnerDatabaseName +
     SharedDatabaseName per serial regardless of whether the device has connected.
+
+    IMPORTANT: LatestDeviceDatabase can also be *stale* rather than blank -- if a
+    device communicated in database A, then was administratively reassigned to
+    database B (e.g. via an UpdateOwnedDatabase admin request) and hasn't
+    communicated again since, GetDeviceContracts keeps reporting A even though
+    MyAdmin's "Primary database" (and this endpoint) correctly show B. So this
+    lookup needs to run for ALL serials, not just the ones with a blank database
+    column -- see reconcile_databases() below.
     """
     if not serials:
         return []
@@ -103,7 +102,6 @@ def get_device_databases_by_serials(serials, creds):
         "serialNumbers": list(serials),
     }
     return call_api("GetDeviceDatabaseNamesAsync", params)
-
 def flatten_dict(d, parent_key="", sep="_"):
     items = []
     for k, v in d.items():
@@ -115,7 +113,6 @@ def flatten_dict(d, parent_key="", sep="_"):
         else:
             items.append((new_key, v))
     return dict(items)
-
 def extract_records(raw_list, account_id):
     records = []
     for dc in raw_list:
@@ -124,31 +121,36 @@ def extract_records(raw_list, account_id):
         dc["input_account_id"] = account_id
         records.append(flatten_dict(dc))
     return records
-
-# ===== MISSING-DATABASE HELPERS =====
+# ===== DATABASE RECONCILIATION HELPERS =====
 # The database a device belongs to comes back under ApiDeviceContract.LatestDeviceDatabase,
 # which flatten_dict turns into columns prefixed "LatestDeviceDatabase_".
 DB_COL_PREFIX = "LatestDeviceDatabase"
-
 def _serial_of(record):
     """Serial number lives on the nested Device object -> Device_SerialNumber after flatten."""
     for key in ("Device_SerialNumber", "SerialNumber", "Device_serialNumber"):
         if record.get(key):
             return record[key]
     return None
-
+def _get_serial_column(df):
+    lower_map = {c.lower(): c for c in df.columns}
+    return next((lower_map[k] for k in
+                 ("device_serialnumber", "serialnumber", "device_serialno", "serialno")
+                 if k in lower_map), None)
+def _get_db_columns(df):
+    return [c for c in df.columns if c.lower().startswith(DB_COL_PREFIX.lower())]
 def find_serials_missing_database(df):
     """Return serials whose latest-device-database columns are all blank.
-
     Column matching is case-insensitive because the JSON-RPC endpoint returns
     camelCase keys (e.g. latestDeviceDatabase_databaseName), not the PascalCase
     shown in the Geotab docs.
+
+    NOTE: this is used only for logging/visibility now (how many devices had no
+    communication-based database at all). The actual reconciliation pass below
+    no longer relies on this to decide *which* serials to look up -- see
+    reconcile_databases().
     """
-    db_cols = [c for c in df.columns if c.lower().startswith(DB_COL_PREFIX.lower())]
-    lower_map = {c.lower(): c for c in df.columns}
-    serial_col = next((lower_map[k] for k in
-                       ("device_serialnumber", "serialnumber", "device_serialno", "serialno")
-                       if k in lower_map), None)
+    db_cols = _get_db_columns(df)
+    serial_col = _get_serial_column(df)
     if not serial_col:
         logger.warning("No serial-number column found; cannot backfill databases.")
         return [], None, db_cols
@@ -162,21 +164,44 @@ def find_serials_missing_database(df):
         ).all(axis=1)
     serials = df.loc[missing_mask, serial_col].dropna().unique().tolist()
     return serials, serial_col, db_cols
+def reconcile_databases(df, creds):
+    """
+    PASS 2 orchestration: reconcile every device's database against the
+    administrative source of truth (GetDeviceDatabaseNamesAsync), not just the
+    ones GetDeviceContracts left blank.
 
-def backfill_missing_databases(df, creds):
+    Why "every device" and not just the blank ones: LatestDeviceDatabase (from
+    Pass 1 / GetDeviceContracts) reflects the last database the device actually
+    *communicated* in. If a device is reassigned to a new database (e.g. via an
+    UpdateOwnedDatabase admin request) and hasn't communicated again since, that
+    field stays populated with the OLD database -- it's stale, not blank, so a
+    blank-only check silently lets the wrong value through. This is exactly what
+    happened for device GAH24274SU82: MyAdmin shows Primary database
+    "imperialpark" (set 2026-07-15), but its last communication record predates
+    that change, so GetDeviceContracts still reported "foss_internal" and the old
+    backfill-only-if-blank logic never corrected it.
+
+    GetDeviceDatabaseNamesAsync returns OwnerDatabaseName / SharedDatabaseName per
+    serial regardless of communication history, so it's the authoritative source
+    for both previously-blank devices and stale-but-populated ones. This function
+    always calls it for every serial in the pull and lets OwnerDatabaseName win.
     """
-    PASS 2 orchestration: for serials whose database came back blank in Pass 1,
-    look up the administrative owner/shared database via GetDeviceDatabaseNamesAsync
-    and write it back in. Adds OwnerDatabaseName / SharedDatabaseName columns and
-    also fills the main database column (LatestDeviceDatabase_DatabaseName) so the
-    primary database is populated even for devices that have never communicated.
-    """
-    serials, serial_col, db_cols = find_serials_missing_database(df)
-    if not serials:
-        logger.info("No devices with a missing database - nothing to backfill.")
+    serial_col = _get_serial_column(df)
+    db_cols = _get_db_columns(df)
+    if not serial_col:
+        logger.warning("No serial-number column found; cannot reconcile databases.")
         return df
-    logger.info(f"{len(serials)} device(s) missing a database; looking up owner/shared DBs: {serials}")
-
+    # Log how many devices had no communication-based database at all, for visibility.
+    missing_serials, _, _ = find_serials_missing_database(df)
+    if missing_serials:
+        logger.info(f"{len(missing_serials)} device(s) have no communication-based "
+                    f"database (never connected): {missing_serials}")
+    serials = df[serial_col].dropna().unique().tolist()
+    if not serials:
+        logger.info("No serials found - nothing to reconcile.")
+        return df
+    logger.info(f"Reconciling database assignment for all {len(serials)} device(s) "
+                f"against GetDeviceDatabaseNamesAsync (authoritative source)...")
     # GetDeviceDatabaseNamesAsync takes an array of serials; batch to keep payloads sane.
     BATCH = 100
     fetched = []
@@ -188,19 +213,21 @@ def backfill_missing_databases(df, creds):
             logger.error(f"Database lookup failed for batch {batch}: {e}")
             raw = []
         fetched.extend(r for r in (raw or []) if isinstance(r, dict))
-
     if not fetched:
-        logger.warning("Database lookup returned nothing; leaving databases blank.")
+        logger.warning("Database lookup returned nothing; leaving databases as-is from Pass 1.")
         return df
-
     # Ensure the destination columns exist.
     for c in ("OwnerDatabaseName", "SharedDatabaseName"):
         if c not in df.columns:
             df[c] = pd.NA
     # Main "database" column from Pass 1 (whatever its actual casing is).
     primary_col = next((c for c in db_cols if c.lower().endswith("databasename")), None)
-
+    if primary_col is None:
+        primary_col = f"{DB_COL_PREFIX}_databaseName"
+        if primary_col not in df.columns:
+            df[primary_col] = pd.NA
     filled = 0
+    corrected_stale = 0
     for rec in fetched:
         # Endpoint returns camelCase keys; fall back to PascalCase just in case.
         serial = rec.get("serialNo") or rec.get("SerialNo")
@@ -213,18 +240,23 @@ def backfill_missing_databases(df, creds):
             continue
         df.loc[mask, "OwnerDatabaseName"] = owner
         df.loc[mask, "SharedDatabaseName"] = shared
-        # Backfill the main database column where it's still blank, using the owner DB.
-        if primary_col in df.columns and owner:
-            blank = mask & (
+        if owner:
+            current = df.loc[mask, primary_col]
+            blank_mask = mask & (
                 df[primary_col].isna() | (df[primary_col].astype(str).str.strip() == "")
             )
-            df.loc[blank, primary_col] = owner
-        filled += int(mask.sum())
-
-    logger.info(f"Backfilled owner/shared database for {filled} row(s) "
-                f"from {len(fetched)} lookup record(s).")
+            stale_mask = mask & ~blank_mask & (df[primary_col].astype(str) != str(owner))
+            # OwnerDatabaseName is the administrative source of truth -- it wins over
+            # whatever LatestDeviceDatabase said, whether that was blank or stale.
+            df.loc[blank_mask | stale_mask, primary_col] = owner
+            filled += int(blank_mask.sum())
+            corrected_stale += int(stale_mask.sum())
+            if stale_mask.any():
+                logger.info(f"  Serial {serial}: corrected stale database "
+                            f"'{current.iloc[0] if len(current) else ''}' -> '{owner}'")
+    logger.info(f"Database reconciliation: filled {filled} blank row(s) and corrected "
+                f"{corrected_stale} stale row(s), from {len(fetched)} lookup record(s).")
     return df
-
 # ===== BILLING STATUS / ACTIVE PLAN HELPERS =====
 # ApiDeviceContract does NOT expose single "BillingStatus" / "ActiveBillingPlan"
 # fields that match MyAdmin's UI verbatim. Reverse-engineered from MyAdmin's own
@@ -258,23 +290,19 @@ def backfill_missing_databases(df, creds):
 # Column matching is case-insensitive because the JSON-RPC endpoint returns
 # camelCase keys (isTerminated, activeDevicePlan_name, activeRatePlans, ...),
 # not the PascalCase used in the Geotab docs.
-
 STATUS_TERMINATED = "TERMINATED"
 STATUS_NEVER_BILLED = "Never billed"           # MyAdmin "Billing status" wording
 PLAN_NEVER_ACTIVATED = "NEVER ACTIVATED"       # MyAdmin "Active billing plan" wording
 STATUS_ACTIVE = "Active"
 SUSPENDED_PLAN_KEYWORDS = ("suspend", "seasonal", "standby")  # unverified, see caveat above
-
 def _find_col(df, *candidates):
     lower_map = {c.lower(): c for c in df.columns}
     for cand in candidates:
         if cand.lower() in lower_map:
             return lower_map[cand.lower()]
     return None
-
 def _is_true(val):
     return str(val).strip().lower() == "true"
-
 def _parse_rate_plans(raw):
     """activeRatePlans comes through flatten_dict as a JSON string (lists are
     json.dumps'd). Parse it back into a list of dicts."""
@@ -287,13 +315,11 @@ def _parse_rate_plans(raw):
         return parsed if isinstance(parsed, list) else []
     except (TypeError, ValueError):
         return []
-
 def _strip_plan_word(name):
     name = (name or "").strip()
     if name.lower().endswith(" plan"):
         name = name[: -len(" plan")]
     return name.strip()
-
 def _format_active_plan(plan_name, rate_plans):
     """Reconstructs MyAdmin's 'Active billing plan' text for an active device."""
     if not rate_plans:
@@ -309,7 +335,6 @@ def _format_active_plan(plan_name, rate_plans):
         else:
             parts.append(f"{rp_name}-{rp_type}" if rp_type else rp_name)
     return ", ".join(p for p in parts if p)
-
 def add_billing_status(df):
     """Adds 'Billing Status' and 'Active Billing Plan' columns matching
     MyAdmin's Device Management grid wording (see note above)."""
@@ -317,35 +342,29 @@ def add_billing_status(df):
     terminated_col = _find_col(df, "IsTerminated")
     unactivated_col = _find_col(df, "IsUnactivated")
     rate_plans_col = _find_col(df, "ActiveRatePlans")
-
     if not plan_name_col:
         logger.warning("No ActiveDevicePlan_Name column found; "
                         "'Active Billing Plan' will be incomplete.")
     if not terminated_col or not unactivated_col:
         logger.warning("IsTerminated/IsUnactivated column(s) missing; "
                         "'Billing Status' may be incomplete.")
-
     def compute(row):
         if terminated_col and _is_true(row.get(terminated_col)):
             return STATUS_TERMINATED, STATUS_TERMINATED
         if unactivated_col and _is_true(row.get(unactivated_col)):
             return STATUS_NEVER_BILLED, PLAN_NEVER_ACTIVATED
-
         plan_name = row.get(plan_name_col) if plan_name_col else None
         rate_plans = _parse_rate_plans(row.get(rate_plans_col)) if rate_plans_col else []
         plan_display = _format_active_plan(plan_name, rate_plans)
-
         status = STATUS_ACTIVE
         if any(k in str(plan_name or "").lower() for k in SUSPENDED_PLAN_KEYWORDS):
             status = "Suspended"  # unverified wording, see caveat above
         return status, plan_display
-
     results = df.apply(compute, axis=1, result_type="expand")
     df["Billing Status"] = results[0]
     df["Active Billing Plan"] = results[1]
     logger.info("Billing Status breakdown:\n%s", df["Billing Status"].value_counts().to_string())
     return df
-
 # ===== HARDWARE ID / PRODUCT CODE HELPERS =====
 # MyAdmin's Device Management grid shows "Hardware ID" and "Product code" as
 # two SEPARATE columns (confirmed against a real row: Hardware ID "571024830",
@@ -364,7 +383,6 @@ def add_billing_status(df):
 # camelCase keys (device_id / deviceId), not the PascalCase used in the docs.
 HARDWARE_ID_CANDIDATES = ("Device_Id", "Device_id", "HardwareId", "HwId")
 PRODUCT_CODE_CANDIDATES = ("ProductCode",)
-
 def add_hardware_id(df):
     """Adds a clean 'Hardware ID' column (from Device.Id) and a clean
     'Product code' column (from ApiDeviceContract.ProductCode), matching
@@ -381,7 +399,6 @@ def add_hardware_id(df):
             "different key, add it to HARDWARE_ID_CANDIDATES.",
             HARDWARE_ID_CANDIDATES, list(df.columns)
         )
-
     pc_col = _find_col(df, *PRODUCT_CODE_CANDIDATES)
     if pc_col and pc_col != "Product code":
         df["Product code"] = df[pc_col]
@@ -389,7 +406,6 @@ def add_hardware_id(df):
         logger.warning("No Product code column found among candidates %s.",
                         PRODUCT_CODE_CANDIDATES)
     return df
-
 # ===== CONTRACT DATES =====
 # Confirmed directly from a live GetDeviceContracts response: "contractStartDate"
 # and "contractEndDate" are top-level scalar fields on the contract (siblings of
@@ -401,10 +417,8 @@ def add_hardware_id(df):
 # "contractStartDate" (camelCase, straight from the JSON-RPC response).
 CONTRACT_START_CANDIDATES = ("contractStartDate",)
 CONTRACT_END_CANDIDATES = ("contractEndDate",)
-
 def add_contract_dates(df):
     """Adds clean 'Contract Start Date' / 'Contract End Date' columns.
-
     Parsed into real (timezone-naive) datetimes so they land as actual dates
     in Excel/Zoho rather than raw ISO-8601 text. Tz-naive is deliberate:
     df.to_excel() raises on timezone-aware datetimes, and the source strings
@@ -413,7 +427,6 @@ def add_contract_dates(df):
     """
     start_col = _find_col(df, *CONTRACT_START_CANDIDATES)
     end_col = _find_col(df, *CONTRACT_END_CANDIDATES)
-
     if start_col:
         df["Contract Start Date"] = pd.to_datetime(
             df[start_col], errors="coerce", utc=True
@@ -422,7 +435,6 @@ def add_contract_dates(df):
         df["Contract Start Date"] = pd.NA
         logger.warning("No Contract Start Date column found among candidates %s.",
                         CONTRACT_START_CANDIDATES)
-
     if end_col:
         df["Contract End Date"] = pd.to_datetime(
             df[end_col], errors="coerce", utc=True
@@ -431,9 +443,7 @@ def add_contract_dates(df):
         df["Contract End Date"] = pd.NA
         logger.warning("No Contract End Date column found among candidates %s.",
                         CONTRACT_END_CANDIDATES)
-
     return df
-
 # ===== ZOHO ANALYTICS v2 FUNCTIONS =====
 def zoho_get_access_token():
     """Exchange the long-lived refresh token for a 1-hour access token."""
@@ -452,10 +462,8 @@ def zoho_get_access_token():
     if "access_token" not in body:
         raise Exception(f"Token refresh failed: {body}")
     return body["access_token"]
-
 # Zoho caps a single import at 20MB. Stay well under it for multipart + encoding overhead.
 ZOHO_MAX_BYTES_PER_IMPORT = 14 * 1024 * 1024
-
 def _zoho_import_chunk(csv_bytes, import_type, access_token):
     url = f"{ZOHO_ANALYTICS['api_domain']}/workspaces/{ZOHO_WORKSPACE_ID}/views/{ZOHO_VIEW_ID}/data"
     config = {
@@ -476,7 +484,6 @@ def _zoho_import_chunk(csv_bytes, import_type, access_token):
         logger.error(f"Zoho response error: {r.text}")
     r.raise_for_status()
     return r.json()
-
 def zoho_truncate_add(df, access_token):
     """
     Replace the entire table with df, chunked to stay under Zoho's 20MB import cap.
@@ -502,7 +509,6 @@ def zoho_truncate_add(df, access_token):
         logger.info(f"  chunk {i // rows_per_chunk + 1}/{n_chunks}: sent {len(chunk)} rows "
               f"(Zoho reported {added}) | cumulative {imported}/{total_rows}")
     logger.info(f"Zoho sync complete: {imported} rows loaded into the table.")
-
 # ===== MAIN =====
 def main():
     creds = authenticate()
@@ -514,7 +520,6 @@ def main():
     if not accounts:
         # Fixed typos: these were GOFLO2 / GOFLO3 (letter O) -> GOFL02 / GOFL03 (zero).
         accounts = ["GOFL01", "GOFL02", "GOFL03"]
-
     all_records = []
     for acc in accounts:
         logger.info(f"Fetching devices for account {acc}...")
@@ -526,30 +531,23 @@ def main():
         recs = extract_records(raw, acc)
         logger.info(f"Got {len(recs)} records for {acc}")
         all_records.extend(recs)
-
     df = pd.DataFrame(all_records)
-
     # Guard: never wipe the Zoho table if the fetch came back empty
     if df.empty:
         logger.info("No records fetched - skipping Zoho sync to avoid wiping the table.")
         return
-
-    # ===== PASS 2: fill in databases for serials the per-account pull missed =====
-    df = backfill_missing_databases(df, creds)
-
+    # ===== PASS 2: reconcile every device's database against the administrative
+    # source of truth, correcting both blanks AND stale-but-populated values =====
+    df = reconcile_databases(df, creds)
     # ===== BILLING STATUS / ACTIVE BILLING PLAN =====
     df = add_billing_status(df)
-
     # ===== HARDWARE ID / PRODUCT CODE =====
     df = add_hardware_id(df)
-
     # ===== CONTRACT START / END DATE =====
     df = add_contract_dates(df)
-
     # ===== ZOHO SYNC =====
     token = zoho_get_access_token()
     zoho_truncate_add(df, token)
-
     # Local backups
     df.to_csv("gofleet_devices_full.csv", index=False)
     df.to_excel(
@@ -559,7 +557,6 @@ def main():
     logger.info("Saved CSV & Excel successfully")
     logger.info(f"Columns: {len(df.columns)}")
     logger.info(f"\n{df.head()}")
-
 def send_failure_email(error_msg: str):
     sender = "nandhinipv@zenduit.com"   # change if needed
     receiver = "nandhinipv@zenduit.com"
@@ -576,7 +573,6 @@ Error:
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(sender, app_password)
         server.send_message(msg)
-
 if __name__ == "__main__":
     try:
         main()
