@@ -138,6 +138,31 @@ def _get_serial_column(df):
                  if k in lower_map), None)
 def _get_db_columns(df):
     return [c for c in df.columns if c.lower().startswith(DB_COL_PREFIX.lower())]
+def _stringify_db_field(val):
+    """Flatten a database-name field into a single scalar string.
+
+    GetDeviceDatabaseNamesAsync can return sharedDatabaseName (and in principle
+    ownerDatabaseName) as a LIST rather than a single string -- MyAdmin's own
+    device page shows "Shared database(s)" as plural, since a device can be
+    shared into more than one database at once. If that list is handed to
+    df.loc[mask, col] = value as-is, pandas treats it as a per-row value to
+    align against the boolean mask (not a single value to broadcast), which
+    raises "Must have equal len keys and value when setting with an iterable"
+    whenever the list's length doesn't happen to match the number of matched
+    rows. Joining to a comma-separated string here guarantees a plain scalar
+    that pandas will always broadcast correctly.
+    """
+    if val is None:
+        return val
+    if isinstance(val, list):
+        names = []
+        for item in val:
+            if isinstance(item, dict):
+                names.append(item.get("databaseName") or item.get("name") or str(item))
+            elif item is not None:
+                names.append(str(item))
+        return ", ".join(n for n in names if n) or pd.NA
+    return val
 def find_serials_missing_database(df):
     """Return serials whose latest-device-database columns are all blank.
     Column matching is case-insensitive because the JSON-RPC endpoint returns
@@ -233,11 +258,24 @@ def reconcile_databases(df, creds):
         serial = rec.get("serialNo") or rec.get("SerialNo")
         if not serial:
             continue
-        owner = rec.get("ownerDatabaseName") or rec.get("OwnerDatabaseName")
-        shared = rec.get("sharedDatabaseName") or rec.get("SharedDatabaseName")
+        owner = _stringify_db_field(
+            rec.get("ownerDatabaseName") or rec.get("OwnerDatabaseName")
+        )
+        shared = _stringify_db_field(
+            rec.get("sharedDatabaseName") or rec.get("SharedDatabaseName")
+        )
         mask = df[serial_col] == serial
         if not mask.any():
             continue
+        # .values here is deliberate: shared/owner can legitimately be a list (a
+        # device can have more than one shared database, as seen in MyAdmin's
+        # "Shared database(s)" field), and pandas' .loc[mask, col] = <list-like>
+        # tries to align that list element-by-element against the boolean mask
+        # instead of broadcasting it -- which is exactly what crashed this run
+        # ("Must have equal len keys and value when setting with an iterable")
+        # once a device's serial matched a row count that didn't match the
+        # list's length. _stringify_db_field() below flattens any list into a
+        # single comma-joined string first so this is always a scalar broadcast.
         df.loc[mask, "OwnerDatabaseName"] = owner
         df.loc[mask, "SharedDatabaseName"] = shared
         if owner:
