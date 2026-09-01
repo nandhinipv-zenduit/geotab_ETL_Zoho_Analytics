@@ -73,8 +73,11 @@ MAX_PAGES = int(os.getenv("GEOTAB_MAX_PAGES", "2000"))
 # GitHub secrets/vars; it is the backstop against a silently short pull.
 MIN_EXPECTED_ROWS = int(os.getenv("GEOTAB_MIN_ROWS", "0"))
 
-# Escape hatch: allow the sync even if the enrichment fields can't be recovered.
-ALLOW_MISSING_FIELDS = os.getenv("GEOTAB_ALLOW_MISSING_FIELDS", "0") == "1"
+# v3 does not return the plan/contract-date fields at all (confirmed against
+# Geotab's published v3 response format), so refusing to sync without them would
+# block forever. Default is now to sync and warn loudly. Set
+# GEOTAB_REQUIRE_FIELDS=1 to go back to aborting instead.
+REQUIRE_FIELDS = os.getenv("GEOTAB_REQUIRE_FIELDS", "0") == "1"
 
 # Pin these once the DISCOVERY log lines tell you what works.
 PIN_PAGINATION = os.getenv("GEOTAB_PAGINATION") or None
@@ -100,14 +103,25 @@ _V2_FALLBACK_OK = set()      # methods proven to still work on /v2/
 _V3_DEAD = set()             # methods proven retired on /v3/
 
 
-def _post(url, method, params, timeout):
+def _post(url, method, params, timeout, pagination=None):
+    """NOTE the placement of `pagination`: Geotab's migration doc puts it at the
+    TOP LEVEL of the JSON-RPC envelope, as a SIBLING of "method" and "params" --
+    NOT inside params. Every pagination attempt before this failed because it was
+    nested inside params, where the server never looks:
+
+        {"id": -1, "method": "GetDeviceContracts",
+         "params": {...},
+         "pagination": {"page": 1, "perPage": 50}}
+    """
     payload = {"id": -1, "method": method, "params": params}
+    if pagination is not None:
+        payload["pagination"] = pagination
     resp = requests.post(url, data={"JSON-RPC": json.dumps(payload)}, timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
     if data.get("error"):
         raise RuntimeError(data["error"])
-    return data.get("result")
+    return data
 
 
 def call_api(method, params, timeout=120):
@@ -120,18 +134,31 @@ def call_api(method, params, timeout=120):
     A timeout is always passed: without one a stalled connection blocks forever,
     which is what used to hang the job on "Fetching devices for account ...".
     """
+    return (call_api_full(method, params, timeout) or {}).get("result")
+
+
+def call_api_full(method, params, timeout=120, pagination=None):
+    """Returns the WHOLE response body, so the caller can read both "result" and
+    the sibling "pagination" block ({page, perPage, total})."""
     if method in _V2_FALLBACK_OK:
-        return _post(MYADMIN_V2, method, params, timeout)
+        return _post(MYADMIN_V2, method, params, timeout, pagination)
     try:
-        return _post(MYADMIN_V3, method, params, timeout)
+        return _post(MYADMIN_V3, method, params, timeout, pagination)
     except RuntimeError as e:
         msg = json.dumps(e.args[0]) if e.args else str(e)
+        # "That method is not yet available for that API version" means the method
+        # EXISTS but is not served on v3 -- so v2 is exactly where to retry. The
+        # first version of this matcher missed that phrasing, so GetDevicePlans,
+        # GetDeviceContractsByPage and friends were reported dead when they were
+        # only absent from v3.
         unavailable = ("no longer available" in msg or "not supported" in msg
-                       or "does not exist" in msg or "Unknown method" in msg)
+                       or "does not exist" in msg or "Unknown method" in msg
+                       or "not yet available for that API version" in msg
+                       or "not available for that API version" in msg)
         if not unavailable:
             raise
         logger.warning(f"{method} unavailable on v3 ({msg[:160]}); retrying on v2")
-        result = _post(MYADMIN_V2, method, params, timeout)
+        result = _post(MYADMIN_V2, method, params, timeout, pagination)
         _V2_FALLBACK_OK.add(method)
         return result
 
@@ -399,12 +426,32 @@ def _run_introspection(base):
             logger.error(f"  introspection '{label}': {_err_text(e)}")
 
 
+DISCOVER_FIELDS = os.getenv("GEOTAB_DISCOVER_FIELDS") == "1"
+
+
 def discover_field_selection(base):
-    """Build the maximal optionalParam selection this schema accepts."""
+    """Build the maximal optionalParam selection this schema accepts.
+
+    Now OPT-IN (GEOTAB_DISCOVER_FIELDS=1). Geotab's migration doc publishes the
+    full v3 response format, and activeDevicePlan, activeRatePlans,
+    latestDeviceDatabase, contractStartDate and contractEndDate are simply not in
+    it -- their absence is the documented behaviour of v3, not a discovery
+    failure. Probing 129 shapes on every run cost ~30s and found nothing, so it
+    stays off until Geotab documents a working optionalParam value.
+    """
     global _field_param, _field_resolved, _missing_required
     if _field_resolved:
         return _field_param
     _field_resolved = True
+
+    if not DISCOVER_FIELDS and not PIN_SELECTION:
+        _missing_required = REQUIRED_NESTED
+        logger.warning(
+            "optionalParam discovery skipped (set GEOTAB_DISCOVER_FIELDS=1 to retry). "
+            "v3 does not return %s, so these columns load EMPTY: Active Billing Plan "
+            "(for active devices), Contract Start Date, Contract End Date.",
+            list(REQUIRED_NESTED))
+        return None
 
     if PIN_SELECTION:
         try:
@@ -498,146 +545,74 @@ def discover_field_selection(base):
     return _field_param
 
 
-# ===== v3 PAGINATION DISCOVERY =====
-PAGINATION_STRATEGIES = ("nextId", "top_page", "pagination_obj", "by_page")
-
-
-def _page_call(strategy, base, page, cursor_id, page_size):
-    """Build and issue one page request for a given pagination dialect."""
-    method = "GetDeviceContracts"
-    if strategy == "nextId":
-        extra = {"nextId": cursor_id}
-    elif strategy == "top_page":
-        extra = {"page": page, "perPage": page_size}
-    elif strategy == "pagination_obj":
-        extra = {"pagination": {"page": page, "perPage": page_size}}
-    elif strategy == "by_page":
-        method = "GetDeviceContractsByPage"
-        extra = {"page": page, "perPage": page_size}
-    else:
-        raise ValueError(strategy)
-    return _as_records(call_api(method, {**base, **extra}))
-
-
-# Page lengths that indicate the server clamped us rather than ran out of data.
-# The server may silently clamp below what we asked for (20 observed while
-# requesting 100), so "shorter than requested" is NOT proof of a last page.
-SUSPICIOUS_CAPS = (20, 25, 50, 100, 200, 250, 500, 1000)
-
-
-def _looks_clamped(n):
-    """Is a page of exactly n records suspiciously round?
-
-    This is the one genuinely ambiguous case: a dialect that is being ignored
-    returns page 1 forever, and an account that simply has n devices also
-    returns the same n forever. We cannot tell them apart from the responses
-    alone, so we lean on the page length: 20 or 100 means "clamped, more data
-    behind" (abort), while 7 or 47 means "that is the whole account" (accept).
-    Erring toward abort is deliberate -- a false alarm costs a red build, a
-    false pass truncates the live Zoho table.
-    """
-    return n == page_size_requested() or n in SUSPICIOUS_CAPS
-
-
-def page_size_requested():
-    return PAGE_SIZE
-
-
-def _walk(strategy, base, page_size):
-    """Page through with one strategy.
-
-    Returns (records, complete). complete is False when a full page came back but
-    the next request produced no new records -- i.e. the dialect is being ignored
-    and we are stuck on page 1 with more data behind it. That distinction is the
-    whole point: a short pull that looks successful is worse than a loud failure,
-    because truncateadd would push it over the live table.
-    """
-    out, seen = [], set()
-    page, cursor_id, first_len = 1, 0, None
-
-    while page <= MAX_PAGES:
-        recs = _page_call(strategy, base, page, cursor_id, page_size)
-        if first_len is None:
-            first_len = len(recs)
-            if first_len == 0:
-                return [], True          # account genuinely has no contracts
-        if not recs:
-            return out, True             # ran off the end cleanly
-
-        new = [r for r in recs if isinstance(r, dict) and r.get("id") not in seen]
-        out.extend(new)
-        seen.update(r.get("id") for r in new)
-
-        if len(recs) < first_len:
-            return out, True             # short page = last page
-        if not new:
-            # Not advancing. Either the dialect is ignored, or this account just
-            # has this many devices and there was never a page 2.
-            return out, not _looks_clamped(len(recs))
-
-        ids = [r.get("id") for r in recs if r.get("id") is not None]
-        cursor_id = max(ids) if ids else cursor_id
-        page += 1
-
-    logger.warning(f"Hit MAX_PAGES={MAX_PAGES} with strategy '{strategy}'")
-    return out, False
-
-
-_pagination = None
+# ===== v3 PAGINATION (documented, no longer guessed) =====
+# From Geotab's "Partner Announcement - New GetDeviceContracts V3 Endpoint":
+#   - pagination is a top-level object in the envelope: {"page": N, "perPage": M}
+#   - page starts at 1; perPage max is 100 and is silently capped at 100
+#   - omitting it defaults to page 1, perPage 20  <- this is why every earlier
+#     call returned exactly 20 records
+#   - the response carries a sibling "pagination": {page, perPage, total}
+# That `total` is the important part: completeness is now an exact check against
+# a number the server gives us, replacing the round-page-size heuristic that had
+# to guess whether 20 records meant "small account" or "truncated".
+PER_PAGE = min(int(os.getenv("GEOTAB_PER_PAGE", "100")), 100)
 
 
 def fetch_contracts(account_id, creds):
-    """Pull every device contract for an account. Raises if it can't prove the
-    pull is complete."""
-    global _pagination
-
-    base = {
+    """Pull every device contract for an account. Raises unless the row count
+    matches the server-reported total."""
+    params = {
         "apiKey": creds["userId"],
         "sessionId": creds["sessionId"],
         "forAccount": account_id,
         "userCompanyId": -1,
         "devicePlanId": -1,
         # includeConnectInfo stays OFF: it attaches connection/GPS data for every
-        # device, which makes a large account (GOFL02) huge and slow. It has no
-        # effect on activeDevicePlan / isTerminated / isUnactivated.
+        # device, making a large account huge and slow, and has no effect on the
+        # billing fields.
         "fromDate": datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z"),
         "toDate": datetime.now(timezone.utc).strftime("%Y-%m-%dT23:59:59Z"),
     }
-    field_param = discover_field_selection(base)
+    field_param = discover_field_selection(params)
     if field_param is not None:
-        base["optionalParam"] = field_param
+        params["optionalParam"] = field_param
 
-    order = list(PAGINATION_STRATEGIES)
-    if PIN_PAGINATION in PAGINATION_STRATEGIES:
-        order = [PIN_PAGINATION]
-    elif _pagination:
-        order = [_pagination] + [s for s in order if s != _pagination]
+    out, page, total = [], 1, None
+    while page <= MAX_PAGES:
+        body = call_api_full("GetDeviceContracts", params,
+                             pagination={"page": page, "perPage": PER_PAGE}) or {}
+        recs = _as_records(body.get("result"))
+        pag = body.get("pagination") or {}
+        if total is None:
+            total = pag.get("total")
+            logger.info(f"  {account_id}: server reports total={total}, "
+                        f"perPage={pag.get('perPage', PER_PAGE)}")
+        out.extend(r for r in recs if isinstance(r, dict))
 
-    best, best_strategy = [], None
-    for strategy in order:
-        try:
-            recs, complete = _walk(strategy, base, PAGE_SIZE)
-        except Exception as e:
-            logger.info(f"  pagination '{strategy}': failed ({str(e)[:140]})")
-            continue
-        if complete:
-            if _pagination != strategy:
-                logger.info(f"DISCOVERY: pagination strategy '{strategy}' works "
-                            f"({len(recs)} records for {account_id})")
-            _pagination = strategy
-            return recs
-        logger.info(f"  pagination '{strategy}': stalled at {len(recs)} record(s) "
-                    f"-- dialect appears to be ignored")
-        if len(recs) > len(best):
-            best, best_strategy = recs, strategy
+        if not recs:
+            break
+        if total is not None and len(out) >= total:
+            break
+        if total is None and len(recs) < PER_PAGE:
+            # No pagination metadata came back; fall back to "a short page is the
+            # last page" and say so, rather than pretending we verified anything.
+            logger.warning(f"  {account_id}: response carried no pagination.total; "
+                           f"completeness cannot be verified exactly.")
+            break
+        page += 1
+    else:
+        raise RuntimeError(f"{account_id}: hit MAX_PAGES={MAX_PAGES} at "
+                           f"{len(out)} record(s) of total={total}")
 
-    raise RuntimeError(
-        f"Cannot paginate {account_id} on MyAdmin v3: every dialect "
-        f"{order} stalled (best was '{best_strategy}' with {len(best)} records, "
-        f"page size appears capped). Refusing to continue -- syncing a partial "
-        f"pull would truncate the Zoho table. Run the probe to find the correct "
-        f"pagination parameter, then set GEOTAB_PAGINATION."
-    )
+    if total is not None and len(out) != total:
+        raise RuntimeError(
+            f"{account_id}: fetched {len(out)} contract(s) but the server reported "
+            f"total={total}. Refusing to continue -- syncing an incomplete pull "
+            f"would truncate the Zoho table.")
+
+    logger.info(f"  {account_id}: {len(out)} contract(s) over {page} page(s) "
+                f"of {PER_PAGE}")
+    return out
 
 
 def get_device_databases_by_serials(serials, creds):
@@ -1154,12 +1129,12 @@ def main():
                        f"to ~{int(len(df) * 0.9)} so a short pull can never "
                        f"silently replace the table.")
 
-    if _missing_required and not ALLOW_MISSING_FIELDS:
+    if _missing_required and REQUIRE_FIELDS:
         raise RuntimeError(
             f"v3 did not return {list(_missing_required)}, so the dependent columns "
             f"(Billing Status, Active Billing Plan, Contract dates, database "
             f"assignment) would load EMPTY and overwrite good data in the table. "
-            f"Aborting. Set GEOTAB_ALLOW_MISSING_FIELDS=1 to sync anyway.")
+            f"Aborting because GEOTAB_REQUIRE_FIELDS=1. Unset it to sync anyway.")
 
     df = reconcile_databases(df, creds)
     df = add_billing_status(df)
