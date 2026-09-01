@@ -49,7 +49,8 @@ os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(
     # GEOTAB_DEBUG=1 also logs every rejected field variant during discovery,
     # which is what you want when a required field can't be recovered.
-    level=logging.DEBUG if os.getenv("GEOTAB_DEBUG") == "1" else logging.INFO,
+    level=logging.DEBUG if (os.getenv("GEOTAB_DEBUG") or "").strip() in
+    ("1", "true", "yes", "on") else logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[
         logging.FileHandler(f"{LOG_DIR}/etl.log"),
@@ -58,29 +59,54 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ===== ENV HELPERS =====
+# GitHub Actions sets `FOO: ${{ vars.FOO }}` to an EMPTY STRING when the repo
+# variable is unset -- it does not omit the variable. So os.getenv(name, default)
+# returns "" rather than the default, and int("") raises. Every numeric and
+# string setting below has to treat empty/whitespace as "not set".
+def _env_str(name, default=None):
+    v = os.getenv(name)
+    return v.strip() if v and v.strip() else default
+
+
+def _env_int(name, default):
+    v = _env_str(name)
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using %s", name, v, default)
+        return default
+
+
+def _env_flag(name, default=False):
+    v = _env_str(name)
+    if v is None:
+        return default
+    return v.lower() in ("1", "true", "yes", "on")
+
+
 # ===== GEOTAB CONFIG =====
 MYADMIN_V3 = "https://myadminapi.geotab.com/v3/MyAdminApi.ashx"
 MYADMIN_V2 = "https://myadminapi.geotab.com/v2/MyAdminApi.ashx"
 USERNAME = os.getenv("GEOTAB_USERNAME")
 PASSWORD = os.getenv("GEOTAB_PASSWORD")
 
-# Requested page size. v3's offset cap is documented as 100; the server may
-# clamp this lower (20 observed) -- the code adapts to whatever it actually gets.
-PAGE_SIZE = int(os.getenv("GEOTAB_PAGE_SIZE", "100"))
-MAX_PAGES = int(os.getenv("GEOTAB_MAX_PAGES", "2000"))
+MAX_PAGES = _env_int("GEOTAB_MAX_PAGES", 2000)
 
 # Safety floor. After one good run, set this to ~90% of the real device count in
 # GitHub secrets/vars; it is the backstop against a silently short pull.
-MIN_EXPECTED_ROWS = int(os.getenv("GEOTAB_MIN_ROWS", "0"))
+MIN_EXPECTED_ROWS = _env_int("GEOTAB_MIN_ROWS", 0)
 
 # v3 does not return the plan/contract-date fields at all (confirmed against
 # Geotab's published v3 response format), so refusing to sync without them would
 # block forever. Default is now to sync and warn loudly. Set
 # GEOTAB_REQUIRE_FIELDS=1 to go back to aborting instead.
-REQUIRE_FIELDS = os.getenv("GEOTAB_REQUIRE_FIELDS", "0") == "1"
+REQUIRE_FIELDS = _env_flag("GEOTAB_REQUIRE_FIELDS")
 
 # Pin these once the DISCOVERY log lines tell you what works.
-PIN_PAGINATION = os.getenv("GEOTAB_PAGINATION") or None
+
 
 # ===== ZOHO ANALYTICS CONFIG (v2 OAuth) =====
 ZOHO_ANALYTICS = {
@@ -94,8 +120,8 @@ ZOHO_ORG_ID = "67409019"
 ZOHO_WORKSPACE_ID = "953790000013364003"
 ZOHO_VIEW_ID = "953790000054827102"   # "Geotab Devices" table
 
-EXCEL_OUT = os.getenv("GEOTAB_EXCEL_OUT", "OP/geotab_op.xlsx")
-CSV_OUT = os.getenv("GEOTAB_CSV_OUT", "gofleet_devices_full.csv")
+EXCEL_OUT = _env_str("GEOTAB_EXCEL_OUT", "OP/geotab_op.xlsx")
+CSV_OUT = _env_str("GEOTAB_CSV_OUT", "gofleet_devices_full.csv")
 
 
 # ===== GEOTAB API HELPER =====
@@ -313,7 +339,7 @@ CANDIDATE_FIELDS = (
     ("warrantyStatus", ("warrantyStatus { name }", "warrantyStatus")),
 )
 
-PIN_SELECTION = os.getenv("GEOTAB_FIELD_SELECTION") or None
+PIN_SELECTION = _env_str("GEOTAB_FIELD_SELECTION")
 
 _field_param = None        # resolved optionalParam string, or None
 _field_resolved = False
@@ -426,7 +452,7 @@ def _run_introspection(base):
             logger.error(f"  introspection '{label}': {_err_text(e)}")
 
 
-DISCOVER_FIELDS = os.getenv("GEOTAB_DISCOVER_FIELDS") == "1"
+DISCOVER_FIELDS = _env_flag("GEOTAB_DISCOVER_FIELDS")
 
 
 def discover_field_selection(base):
@@ -555,7 +581,7 @@ def discover_field_selection(base):
 # That `total` is the important part: completeness is now an exact check against
 # a number the server gives us, replacing the round-page-size heuristic that had
 # to guess whether 20 records meant "small account" or "truncated".
-PER_PAGE = min(int(os.getenv("GEOTAB_PER_PAGE", "100")), 100)
+PER_PAGE = max(1, min(_env_int("GEOTAB_PER_PAGE", 100), 100))
 
 
 def fetch_contracts(account_id, creds):
@@ -1150,7 +1176,7 @@ def main():
 
 
 def send_failure_email(error_msg: str):
-    app_password = os.getenv("gmail_pass") or os.getenv("GMAIL_PASS")
+    app_password = _env_str("gmail_pass") or _env_str("GMAIL_PASS")
     if not app_password:
         # The workflow never passed this secret, so every failure email silently
         # died here. Say so plainly instead of raising an opaque SMTP error.
