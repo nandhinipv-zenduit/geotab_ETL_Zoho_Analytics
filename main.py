@@ -28,7 +28,7 @@ MIGRATED TO MyAdmin v3. What changed and why:
 
 Both discoveries are logged with a "DISCOVERY:" prefix. Once the log tells you
 which strategy won, you can pin it via env vars (GEOTAB_PAGINATION /
-GEOTAB_FIELD_SYNTAX) to skip the probing on every run.
+GEOTAB_FIELD_SELECTION) to skip the probing on every run.
 """
 
 import json
@@ -46,7 +46,9 @@ import requests
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(
-    level=logging.INFO,
+    # GEOTAB_DEBUG=1 also logs every rejected field variant during discovery,
+    # which is what you want when a required field can't be recovered.
+    level=logging.DEBUG if os.getenv("GEOTAB_DEBUG") == "1" else logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[
         logging.FileHandler(f"{LOG_DIR}/etl.log"),
@@ -75,7 +77,6 @@ ALLOW_MISSING_FIELDS = os.getenv("GEOTAB_ALLOW_MISSING_FIELDS", "0") == "1"
 
 # Pin these once the DISCOVERY log lines tell you what works.
 PIN_PAGINATION = os.getenv("GEOTAB_PAGINATION") or None
-PIN_FIELD_SYNTAX = os.getenv("GEOTAB_FIELD_SYNTAX") or None
 
 # ===== ZOHO ANALYTICS CONFIG (v2 OAuth) =====
 ZOHO_ANALYTICS = {
@@ -139,45 +140,86 @@ def authenticate():
 
 
 # ===== v3 FIELD SELECTION (optionalParam) DISCOVERY =====
-# Fields the enrichment steps below depend on. v3 omits these unless asked.
+# Run #677 settled the envelope question empirically:
+#   - every STRING encoding failed with "Unable to process Graphql query", which
+#     is a parse/validation failure -- so optionalParam IS accepted and IS parsed
+#     as GraphQL; the selection content was what it rejected.
+#   - the dict encoding failed with "Object of type
+#     'System.Collections.Generic.Dictionary`2[System.String,System.Object]'",
+#     so optionalParam must be a string, never an object.
+#
+# The likely culprit in the original selection: GraphQL requires a subselection
+# on object-valued fields and forbids one on scalars, so a single bad field name
+# (bare `account`, bare `warrantyStatus`) rejects the WHOLE query. Guessing entire
+# selections can therefore never converge -- one wrong field hides all the right
+# ones.
+#
+# So discovery is now bottom-up:
+#   1. find the envelope that accepts the single field `id`
+#   2. add candidate fields ONE AT A TIME (trying each field's plausible
+#      subselection shapes), keeping a field only if the call succeeds AND the key
+#      actually appears in the response
+# The result is the maximal selection this schema will accept. It is logged as a
+# ready-to-paste GEOTAB_FIELD_SELECTION=... so you can pin it and skip the ~25
+# discovery calls on later runs.
+
+# Fields the enrichment steps depend on. Missing any of these means Billing
+# Status / Active Billing Plan / Contract dates / database columns load empty.
 REQUIRED_NESTED = ("activeDevicePlan", "activeRatePlans",
                    "latestDeviceDatabase", "contractStartDate", "contractEndDate")
 
-_SELECTION = """
-  id
-  account
-  startDate
-  endDate
-  contractStartDate
-  contractEndDate
-  productCode
-  assignedPurchaseOrderNo
-  warrantyStatus
-  isTerminated
-  isUnactivated
-  activeTrackingDisabled
-  firstDeviceActivationDate
-  device { id serialNumber }
-  activeDevicePlan { id name }
-  activeRatePlans { ratePlan { ratePlanName ratePlanType { name } } }
-  latestDeviceDatabase { databaseName }
-"""
-_COMPACT = " ".join(_SELECTION.split())
+# %s is the field selection.
+ENVELOPES = (
+    ("braced", "{ %s }"),
+    ("bare", "%s"),
+    ("query", "query { %s }"),
+    ("typed", "{ apiDeviceContract { %s } }"),
+    ("plural", "{ deviceContracts { %s } }"),
+    ("singular", "{ deviceContract { %s } }"),
+    ("data", "{ data { %s } }"),
+)
 
-FIELD_SYNTAXES = {
-    "braced": "{ " + _COMPACT + " }",
-    "unbraced": _COMPACT,
-    "query": "query { deviceContracts { " + _COMPACT + " } }",
-    "typed": "{ apiDeviceContract { " + _COMPACT + " } }",
-    "fieldlist": {"fields": list(REQUIRED_NESTED)},
-}
+# (response key, variants to try in order). Scalars have one variant; object
+# fields list their plausible subselections, widest first. Order matters only in
+# that a field is dropped if none of its variants are accepted.
+CANDIDATE_FIELDS = (
+    ("contractStartDate", ("contractStartDate",)),
+    ("contractEndDate", ("contractEndDate",)),
+    ("productCode", ("productCode",)),
+    ("isTerminated", ("isTerminated",)),
+    ("isUnactivated", ("isUnactivated",)),
+    ("activeTrackingDisabled", ("activeTrackingDisabled",)),
+    ("firstDeviceActivationDate", ("firstDeviceActivationDate",)),
+    ("startDate", ("startDate",)),
+    ("endDate", ("endDate",)),
+    ("assignedPurchaseOrderNo", ("assignedPurchaseOrderNo",)),
+    ("device", ("device { id serialNumber }", "device { id }",
+                "device { serialNumber }", "device")),
+    ("activeDevicePlan", ("activeDevicePlan { id name }", "activeDevicePlan { name }",
+                          "activeDevicePlan")),
+    ("activeRatePlans", (
+        "activeRatePlans { ratePlan { ratePlanName ratePlanType { name } } }",
+        "activeRatePlans { ratePlan { ratePlanName } }",
+        "activeRatePlans { ratePlanName ratePlanType { name } }",
+        "activeRatePlans { ratePlanName }",
+        "activeRatePlans")),
+    ("latestDeviceDatabase", ("latestDeviceDatabase { databaseName }",
+                              "latestDeviceDatabase { name }",
+                              "latestDeviceDatabase")),
+    ("account", ("account { id name }", "account { accountId }",
+                 "account { id }", "account")),
+    ("warrantyStatus", ("warrantyStatus { name }", "warrantyStatus")),
+)
 
-_field_syntax = None          # resolved name, or "none"
-_field_param = None           # resolved optionalParam value, or None
+PIN_SELECTION = os.getenv("GEOTAB_FIELD_SELECTION") or None
+
+_field_param = None        # resolved optionalParam string, or None
+_field_resolved = False
+_missing_required = ()     # required fields discovery could not recover
 
 
 def _as_records(result):
-    """v3 returned a plain array in probing, but tolerate a wrapper too."""
+    """v3 returned a plain array when probed, but tolerate a wrapper too."""
     if isinstance(result, list):
         return result
     if isinstance(result, dict):
@@ -187,45 +229,87 @@ def _as_records(result):
     return []
 
 
-def discover_field_syntax(base):
-    """Find the optionalParam encoding that brings the nested fields back."""
-    global _field_syntax, _field_param
-    if _field_syntax is not None:
+def _try_selection(base, optional_param):
+    """One GetDeviceContracts call with a candidate optionalParam.
+    Returns records, or raises."""
+    params = dict(base)
+    params["optionalParam"] = optional_param
+    return _as_records(call_api("GetDeviceContracts", params))
+
+
+def discover_field_selection(base):
+    """Build the maximal optionalParam selection this schema accepts."""
+    global _field_param, _field_resolved, _missing_required
+    if _field_resolved:
         return _field_param
+    _field_resolved = True
 
-    order = list(FIELD_SYNTAXES)
-    if PIN_FIELD_SYNTAX in FIELD_SYNTAXES:
-        order = [PIN_FIELD_SYNTAX]
-
-    for name in order:
-        candidate = FIELD_SYNTAXES[name]
+    if PIN_SELECTION:
         try:
-            recs = _as_records(call_api(
-                "GetDeviceContracts", {**base, "optionalParam": candidate}))
-        except Exception as e:
-            logger.info(f"  field syntax '{name}': rejected ({str(e)[:120]})")
-            continue
-        if not recs:
-            logger.info(f"  field syntax '{name}': accepted but returned 0 records")
-            continue
-        keys = set(recs[0])
-        present = [f for f in REQUIRED_NESTED if f in keys]
-        if present:
-            logger.info(f"DISCOVERY: field syntax '{name}' works -- recovered "
-                        f"{len(present)}/{len(REQUIRED_NESTED)} field(s): {present}")
-            if len(present) < len(REQUIRED_NESTED):
-                logger.warning("  still missing: "
-                               f"{[f for f in REQUIRED_NESTED if f not in keys]}")
-            _field_syntax, _field_param = name, candidate
+            recs = _try_selection(base, PIN_SELECTION)
+            keys = set(recs[0]) if recs else set()
+            _missing_required = tuple(f for f in REQUIRED_NESTED if f not in keys)
+            if _missing_required:
+                logger.warning(f"Pinned GEOTAB_FIELD_SELECTION is missing "
+                               f"{_missing_required}; unset it to re-discover.")
+            else:
+                logger.info("Using pinned GEOTAB_FIELD_SELECTION.")
+            _field_param = PIN_SELECTION
             return _field_param
-        logger.info(f"  field syntax '{name}': accepted, but none of the wanted "
-                    f"fields came back (keys: {sorted(keys)})")
+        except Exception as e:
+            logger.error(f"Pinned GEOTAB_FIELD_SELECTION rejected: {str(e)[:400]}. "
+                         f"Falling back to discovery.")
 
-    _field_syntax, _field_param = "none", None
-    logger.error("DISCOVERY FAILED: no optionalParam encoding recovered "
-                 f"{REQUIRED_NESTED}. Billing Status / Active Billing Plan / "
-                 "Contract dates / database reconciliation will all be EMPTY.")
-    return None
+    # --- step 1: which envelope accepts a single scalar field?
+    envelope = None
+    for name, fmt in ENVELOPES:
+        try:
+            recs = _try_selection(base, fmt % "id")
+        except Exception as e:
+            logger.info(f"  envelope '{name}': rejected -- {str(e)[:400]}")
+            continue
+        if recs and isinstance(recs[0], dict) and "id" in recs[0]:
+            logger.info(f"DISCOVERY: optionalParam envelope '{name}' accepted "
+                        f"({fmt % 'id'})")
+            envelope = fmt
+            break
+        logger.info(f"  envelope '{name}': accepted but no 'id' in the response")
+
+    if envelope is None:
+        logger.error("DISCOVERY FAILED: no optionalParam envelope accepted even the "
+                     "single field 'id'. The selection language is not what we "
+                     "assume -- check the full errors above for the expected shape.")
+        _field_param = None
+        _missing_required = REQUIRED_NESTED
+        return None
+
+    # --- step 2: add fields one at a time; keep only what survives
+    accepted, rejected = ["id"], []
+    for key, variants in CANDIDATE_FIELDS:
+        for variant in variants:
+            candidate = envelope % " ".join(accepted + [variant])
+            try:
+                recs = _try_selection(base, candidate)
+            except Exception as e:
+                logger.debug(f"    {key} as '{variant}': {str(e)[:200]}")
+                continue
+            if recs and isinstance(recs[0], dict) and key in recs[0]:
+                accepted.append(variant)
+                break
+        else:
+            rejected.append(key)
+
+    _field_param = envelope % " ".join(accepted)
+    _missing_required = tuple(f for f in REQUIRED_NESTED if f in rejected)
+
+    logger.info(f"DISCOVERY: accepted {len(accepted)} field(s); "
+                f"dropped {rejected or 'none'}")
+    logger.info(f"DISCOVERY: pin this to skip discovery next run ->\n"
+                f"           GEOTAB_FIELD_SELECTION={_field_param}")
+    if _missing_required:
+        logger.error(f"Required field(s) {_missing_required} could not be recovered "
+                     f"from the v3 schema. The dependent columns will be EMPTY.")
+    return _field_param
 
 
 # ===== v3 PAGINATION DISCOVERY =====
@@ -333,7 +417,7 @@ def fetch_contracts(account_id, creds):
         "fromDate": datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z"),
         "toDate": datetime.now(timezone.utc).strftime("%Y-%m-%dT23:59:59Z"),
     }
-    field_param = discover_field_syntax(base)
+    field_param = discover_field_selection(base)
     if field_param is not None:
         base["optionalParam"] = field_param
 
@@ -884,13 +968,12 @@ def main():
                        f"to ~{int(len(df) * 0.9)} so a short pull can never "
                        f"silently replace the table.")
 
-    if _field_syntax == "none" and not ALLOW_MISSING_FIELDS:
+    if _missing_required and not ALLOW_MISSING_FIELDS:
         raise RuntimeError(
-            "v3 did not return activeDevicePlan / activeRatePlans / "
-            "latestDeviceDatabase / contract dates, so Billing Status, Active "
-            "Billing Plan, Contract dates and the database columns would all load "
-            "EMPTY and overwrite good data. Aborting. Set "
-            "GEOTAB_ALLOW_MISSING_FIELDS=1 to sync anyway.")
+            f"v3 did not return {list(_missing_required)}, so the dependent columns "
+            f"(Billing Status, Active Billing Plan, Contract dates, database "
+            f"assignment) would load EMPTY and overwrite good data in the table. "
+            f"Aborting. Set GEOTAB_ALLOW_MISSING_FIELDS=1 to sync anyway.")
 
     df = reconcile_databases(df, creds)
     df = add_billing_status(df)
