@@ -36,6 +36,7 @@ import logging
 import os
 import re
 import smtplib
+import time
 import traceback
 from datetime import datetime, timezone
 from email.mime.text import MIMEText
@@ -142,7 +143,15 @@ def _post(url, method, params, timeout, pagination=None):
     payload = {"id": -1, "method": method, "params": params}
     if pagination is not None:
         payload["pagination"] = pagination
-    resp = requests.post(url, data={"JSON-RPC": json.dumps(payload)}, timeout=timeout)
+    for attempt in range(4):
+        resp = requests.post(url, data={"JSON-RPC": json.dumps(payload)}, timeout=timeout)
+        if resp.status_code != 429:
+            break
+        # MyAdmin rate limits (per-method and 5000/min per IP). Documented
+        # behaviour is a 429; back off and retry rather than failing the run.
+        wait = 30 * (attempt + 1)
+        logger.warning(f"429 rate-limited on {method}; retrying in {wait}s")
+        time.sleep(wait)
     resp.raise_for_status()
     data = resp.json()
     if data.get("error"):
@@ -472,10 +481,10 @@ def discover_field_selection(base):
 
     if not DISCOVER_FIELDS and not PIN_SELECTION:
         _missing_required = REQUIRED_NESTED
-        logger.warning(
-            "optionalParam discovery skipped (set GEOTAB_DISCOVER_FIELDS=1 to retry). "
-            "v3 does not return %s, so these columns load EMPTY: Active Billing Plan "
-            "(for active devices), Contract Start Date, Contract End Date.",
+        logger.info(
+            "optionalParam discovery skipped (v3 does not return %s; set "
+            "GEOTAB_DISCOVER_FIELDS=1 to re-probe). These fields will instead be "
+            "enriched from GetDeviceContractsByPage@v2 after each account's pull.",
             list(REQUIRED_NESTED))
         return None
 
@@ -585,8 +594,19 @@ PER_PAGE = max(1, min(_env_int("GEOTAB_PER_PAGE", 100), 100))
 
 
 def fetch_contracts(account_id, creds):
-    """Pull every device contract for an account. Raises unless the row count
-    matches the server-reported total."""
+    """Pull every device contract for an account.
+
+    Source strategy (inverted after run #685 spent 25 minutes paging):
+      1. ONE v3 call establishes the authoritative record count -- its
+         pagination.total is the completeness proof.
+      2. GetDeviceContractsByPage@v2 is the PRIMARY bulk source: 1000 records
+         per call instead of v3's 100-per-page cap (72,892 records = ~73 calls
+         instead of 729), and it still returns the full ApiDeviceContract
+         serializer -- activeDevicePlan, activeRatePlans, latestDeviceDatabase
+         and the contract dates that v3 omits. No enrichment pass needed.
+      3. Only if ByPage@v2 is gone or under-delivers against the v3 total does
+         the documented v3 page walk run, followed by best-effort enrichment.
+    """
     params = {
         "apiKey": creds["userId"],
         "sessionId": creds["sessionId"],
@@ -603,29 +623,62 @@ def fetch_contracts(account_id, creds):
     if field_param is not None:
         params["optionalParam"] = field_param
 
-    out, page, total = [], 1, None
-    while page <= MAX_PAGES:
-        body = call_api_full("GetDeviceContracts", params,
-                             pagination={"page": page, "perPage": PER_PAGE}) or {}
-        recs = _as_records(body.get("result"))
-        pag = body.get("pagination") or {}
-        if total is None:
-            total = pag.get("total")
-            logger.info(f"  {account_id}: server reports total={total}, "
-                        f"perPage={pag.get('perPage', PER_PAGE)}")
-        out.extend(r for r in recs if isinstance(r, dict))
+    # --- 1) authoritative count from v3 (also serves as page 1 of the fallback)
+    body = call_api_full("GetDeviceContracts", params,
+                         pagination={"page": 1, "perPage": PER_PAGE}) or {}
+    first_page = [r for r in _as_records(body.get("result")) if isinstance(r, dict)]
+    total = (body.get("pagination") or {}).get("total")
+    logger.info(f"  {account_id}: v3 reports total={total}")
+    if total == 0 or (not first_page and total is None):
+        logger.info(f"  {account_id}: no contracts.")
+        return []
 
-        if not recs:
-            break
+    clean = {k: v for k, v in params.items() if k != "optionalParam"}
+
+    # --- 2) primary source: ByPage@v2 (full fields, 1000/call)
+    global _v2_enrich_dead
+    v2 = None
+    if ENRICH_FROM_V2 and not _v2_enrich_dead:
+        try:
+            v2 = _fetch_v2_bypage(clean, account_id, expected=total)
+        except Exception as e:
+            _v2_enrich_dead = True
+            logger.warning(
+                f"GetDeviceContractsByPage@v2 unavailable "
+                f"({_err_text(e) if isinstance(e, RuntimeError) else e}); using the "
+                f"v3 page walk -- plan/contract-date columns will be empty.")
+        else:
+            if total is not None and len(v2) < total:
+                logger.warning(f"  {account_id}: ByPage@v2 returned {len(v2)} < v3 "
+                               f"total {total}; falling back to the v3 walk and "
+                               f"merging v2 fields onto it.")
+            else:
+                logger.info(f"  {account_id}: ByPage@v2 is the primary source -- "
+                            f"{len(v2)} record(s), full field set "
+                            f"(v3 total={total}).")
+                return v2
+
+    # --- 3) fallback: documented v3 page walk (bare fields), with progress
+    out, page = list(first_page), 1
+    while page < MAX_PAGES:
         if total is not None and len(out) >= total:
             break
-        if total is None and len(recs) < PER_PAGE:
-            # No pagination metadata came back; fall back to "a short page is the
-            # last page" and say so, rather than pretending we verified anything.
+        if total is None and len(first_page) < PER_PAGE:
             logger.warning(f"  {account_id}: response carried no pagination.total; "
                            f"completeness cannot be verified exactly.")
             break
         page += 1
+        body = call_api_full("GetDeviceContracts", params,
+                             pagination={"page": page, "perPage": PER_PAGE}) or {}
+        recs = [r for r in _as_records(body.get("result")) if isinstance(r, dict)]
+        if not recs:
+            break
+        out.extend(recs)
+        if page % 25 == 0:
+            logger.info(f"    {account_id} v3 walk: {len(out)}/{total or '?'} "
+                        f"records (page {page})")
+        if total is None and len(recs) < PER_PAGE:
+            break
     else:
         raise RuntimeError(f"{account_id}: hit MAX_PAGES={MAX_PAGES} at "
                            f"{len(out)} record(s) of total={total}")
@@ -636,9 +689,97 @@ def fetch_contracts(account_id, creds):
             f"total={total}. Refusing to continue -- syncing an incomplete pull "
             f"would truncate the Zoho table.")
 
-    logger.info(f"  {account_id}: {len(out)} contract(s) over {page} page(s) "
-                f"of {PER_PAGE}")
+    logger.info(f"  {account_id}: {len(out)} contract(s) via v3 over {page} page(s)")
+    return enrich_from_v2(account_id, params, out, prefetched=v2)
+
+
+
+
+
+# ===== FIELD ENRICHMENT FROM GetDeviceContractsByPage (v2) =====
+# v3's documented response omits activeDevicePlan, activeRatePlans,
+# latestDeviceDatabase and the contract dates, and optionalParam rejects every
+# form we've tried. But only GetDeviceContracts was retired on v2 --
+# GetDeviceContractsByPage is documented as a v2 method returning full
+# ApiDeviceContract objects, the very serializer the old ETL relied on. So:
+# v3 remains the authoritative row set (its pagination.total proves
+# completeness), and each record is enriched with the missing fields from a
+# ByPage@v2 pull of the same account, joined on contract id (serial number as
+# fallback). If Geotab eventually retires ByPage on v2 too, enrichment logs a
+# warning and the sync continues without those columns -- same degraded state
+# as today, never a crash.
+ENRICH_FROM_V2 = _env_flag("GEOTAB_ENRICH_FROM_V2", True)
+V2_ENRICH_FIELDS = ("activeDevicePlan", "activeRatePlans", "latestDeviceDatabase",
+                    "contractStartDate", "contractEndDate", "billingStartDate")
+V2_PAGE_LIMIT = 1000          # documented: ByPage caps a result set at 1000
+_v2_enrich_dead = False
+
+
+def _fetch_v2_bypage(params, account_id="", expected=None):
+    """Walk GetDeviceContractsByPage on v2 with its documented nextId paging
+    (1000 records per call), logging progress -- a 73-page walk with no output
+    is indistinguishable from a hang."""
+    out, next_id, pages = [], 0, 0
+    for _ in range(MAX_PAGES):
+        body = _post(MYADMIN_V2, "GetDeviceContractsByPage",
+                     {**params, "nextId": next_id}, 300) or {}
+        recs = [r for r in _as_records(body.get("result")) if isinstance(r, dict)]
+        out.extend(recs)
+        pages += 1
+        if pages % 5 == 0 or len(recs) < V2_PAGE_LIMIT:
+            logger.info(f"    {account_id} ByPage@v2: {len(out)}"
+                        f"{'/' + str(expected) if expected else ''} records "
+                        f"({pages} call(s))")
+        if len(recs) < V2_PAGE_LIMIT:
+            break
+        ids = [r.get("id") for r in recs if r.get("id") is not None]
+        if not ids:
+            break
+        next_id = max(ids)
     return out
+
+
+def enrich_from_v2(account_id, params, v3_records, prefetched=None):
+    """Copy the v2-only fields onto the v3 rows. Best-effort by design."""
+    global _v2_enrich_dead
+    if not ENRICH_FROM_V2 or _v2_enrich_dead or not v3_records:
+        return v3_records
+    clean = {k: v for k, v in params.items() if k != "optionalParam"}
+    try:
+        v2 = prefetched if prefetched is not None else _fetch_v2_bypage(clean, account_id)
+    except Exception as e:
+        _v2_enrich_dead = True
+        logger.warning(f"GetDeviceContractsByPage@v2 enrichment unavailable "
+                       f"({_err_text(e) if isinstance(e, RuntimeError) else e}); "
+                       f"plan/contract-date columns will be empty.")
+        return v3_records
+
+    by_id = {r.get("id"): r for r in v2 if r.get("id") is not None}
+    by_serial = {}
+    for r in v2:
+        dev = r.get("device")
+        if isinstance(dev, dict) and dev.get("serialNumber"):
+            by_serial[dev["serialNumber"]] = r
+
+    matched = 0
+    for rec in v3_records:
+        src = by_id.get(rec.get("id"))
+        if src is None:
+            dev = rec.get("device")
+            if isinstance(dev, dict):
+                src = by_serial.get(dev.get("serialNumber"))
+        if src is None:
+            continue
+        matched += 1
+        for f in V2_ENRICH_FIELDS:
+            if f in src and f not in rec:
+                rec[f] = src[f]
+    logger.info(f"  {account_id}: enriched {matched}/{len(v3_records)} record(s) "
+                f"from GetDeviceContractsByPage@v2 ({len(v2)} v2 record(s))")
+    if matched < len(v3_records):
+        logger.warning(f"  {account_id}: {len(v3_records) - matched} record(s) had no "
+                       f"v2 match; their plan/date fields stay empty.")
+    return v3_records
 
 
 def get_device_databases_by_serials(serials, creds):
@@ -1155,9 +1296,20 @@ def main():
                        f"to ~{int(len(df) * 0.9)} so a short pull can never "
                        f"silently replace the table.")
 
-    if _missing_required and REQUIRE_FIELDS:
+    # Judge by the DataFrame itself: enrichment may have supplied fields v3
+    # omitted, or failed to. Column prefixes, because flatten_dict expands the
+    # nested objects (activeDevicePlan -> activeDevicePlan_name, ...).
+    still_missing = tuple(
+        f for f in REQUIRED_NESTED
+        if not any(c.lower().startswith(f.lower()) for c in df.columns))
+    if still_missing:
+        logger.warning(f"Fields absent from the final dataset: {list(still_missing)} "
+                       f"- their columns will load empty.")
+    else:
+        logger.info("All required plan/contract-date fields present in the dataset.")
+    if still_missing and REQUIRE_FIELDS:
         raise RuntimeError(
-            f"v3 did not return {list(_missing_required)}, so the dependent columns "
+            f"The dataset is missing {list(still_missing)}, so the dependent columns "
             f"(Billing Status, Active Billing Plan, Contract dates, database "
             f"assignment) would load EMPTY and overwrite good data in the table. "
             f"Aborting because GEOTAB_REQUIRE_FIELDS=1. Unset it to sync anyway.")
