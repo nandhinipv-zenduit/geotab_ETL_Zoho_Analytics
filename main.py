@@ -163,10 +163,21 @@ def authenticate():
 # ready-to-paste GEOTAB_FIELD_SELECTION=... so you can pin it and skip the ~25
 # discovery calls on later runs.
 
-# Fields the enrichment steps depend on. Missing any of these means Billing
-# Status / Active Billing Plan / Contract dates / database columns load empty.
+# Fields with no alternative source. Without these, Active Billing Plan and the
+# Contract dates load empty, so their absence blocks the sync.
 REQUIRED_NESTED = ("activeDevicePlan", "activeRatePlans",
-                   "latestDeviceDatabase", "contractStartDate", "contractEndDate")
+                   "contractStartDate", "contractEndDate")
+
+# Requested too, but NOT blocking: latestDeviceDatabase is only Pass 1's guess at
+# the database, and reconcile_databases() overwrites it wholesale from
+# GetDeviceDatabaseNamesAsync -- which is the administrative source of truth and
+# needs no optionalParam. Losing it costs nothing.
+OPTIONAL_NESTED = ("latestDeviceDatabase",)
+
+# Note on partial degradation: isTerminated and isUnactivated ARE in v3's bare
+# response, so the TERMINATED and "Never billed" branches of Billing Status work
+# even with no optionalParam at all. Only the "Active" plan text needs
+# activeDevicePlan + activeRatePlans.
 
 # Run #678 named the real constraint. The full error was:
 #     MyAdminException: Unable to process Graphql query
@@ -270,12 +281,83 @@ def _as_records(result):
     return []
 
 
-def _try_selection(base, optional_param):
-    """One GetDeviceContracts call with a candidate optionalParam.
-    Returns records, or raises."""
+def _try_selection_raw(base, optional_param):
+    """One GetDeviceContracts call with a candidate optionalParam. Returns the
+    RAW result so a shape that succeeded with an unfamiliar payload shape can be
+    reported instead of discarded."""
     params = dict(base)
     params["optionalParam"] = optional_param
-    return _as_records(call_api("GetDeviceContracts", params))
+    return call_api("GetDeviceContracts", params)
+
+
+def _try_selection(base, optional_param):
+    return _as_records(_try_selection_raw(base, optional_param))
+
+
+def _err_text(e):
+    """Flatten a MyAdmin JSON-RPC error into its innermost messages, which is
+    where the useful text lives ('forAccount not provided!' was nested two levels
+    down inside 'errors')."""
+    payload = e.args[0] if e.args else str(e)
+    if isinstance(payload, dict):
+        parts = [str(payload.get("message", "")).strip()]
+        for sub in payload.get("errors") or []:
+            if isinstance(sub, dict):
+                msg = str(sub.get("message", "")).strip()
+                if msg and msg not in parts:
+                    parts.append(msg)
+        return " | ".join(p for p in parts if p)[:600]
+    return str(payload)[:600]
+
+
+# GraphQL servers usually answer introspection, and one successful introspection
+# call would replace all of this guessing with the actual schema. Only run on
+# failure, to keep the happy path cheap.
+INTROSPECTION_PROBES = (
+    ("root query fields", "{ __schema { queryType { name fields { name } } } }"),
+    ("all type names", "{ __schema { types { name } } }"),
+    ("ApiDeviceContract", '{ __type(name: "ApiDeviceContract") { name kind '
+                          'fields { name type { name kind } } } }'),
+    ("DeviceContract", '{ __type(name: "DeviceContract") { name kind '
+                       'fields { name type { name kind } } } }'),
+)
+
+
+ALTERNATE_METHODS = ("GetDeviceContractsByPage", "GetPartnerDeviceContractsAsync")
+
+
+def _probe_alternate_methods(base):
+    """Maybe a sibling method still returns the nested fields WITHOUT optionalParam.
+    If one does, we can source activeDevicePlan / activeRatePlans / the contract
+    dates from there and skip the GraphQL problem entirely."""
+    logger.error("--- checking whether a sibling method returns the nested fields "
+                 "without optionalParam ---")
+    wanted = set(REQUIRED_NESTED) | set(OPTIONAL_NESTED)
+    for method in ALTERNATE_METHODS:
+        try:
+            recs = _as_records(call_api(method, dict(base)))
+        except Exception as e:
+            logger.error(f"  {method}: {_err_text(e)}")
+            continue
+        if not recs or not isinstance(recs[0], dict):
+            logger.error(f"  {method}: returned {len(recs)} record(s), no dict payload")
+            continue
+        keys = sorted(recs[0])
+        have = sorted(wanted & set(keys))
+        logger.error(f"  {method}: {len(recs)} record(s); keys = {keys}")
+        logger.error(f"      wanted fields present: {have or 'NONE'}")
+
+
+def _run_introspection(base):
+    logger.error("--- attempting GraphQL introspection (this would give us the "
+                 "real schema; a failure here is informative too) ---")
+    for label, query in INTROSPECTION_PROBES:
+        try:
+            raw = _try_selection_raw(base, query)
+            logger.error(f"  introspection '{label}' SUCCEEDED -> "
+                         f"{json.dumps(raw, default=str)[:1500]}")
+        except Exception as e:
+            logger.error(f"  introspection '{label}': {_err_text(e)}")
 
 
 def discover_field_selection(base):
@@ -304,24 +386,41 @@ def discover_field_selection(base):
     # --- step 1: which root field + argument set accepts a single scalar field?
     envelope = None
     tried = 0
+    errors = {}          # distinct error text -> [shape labels]
+    unrecognized = []    # shapes that SUCCEEDED but returned an unfamiliar payload
+
     for name, fmt in _envelope_candidates(base):
         tried += 1
         try:
-            recs = _try_selection(base, fmt % "id")
+            raw = _try_selection_raw(base, fmt % "id")
         except Exception as e:
-            logger.debug(f"  envelope '{name}': rejected -- {str(e)[:400]}")
+            errors.setdefault(_err_text(e), []).append(name)
             continue
+        recs = _as_records(raw)
         if recs and isinstance(recs[0], dict) and "id" in recs[0]:
             logger.info(f"DISCOVERY: optionalParam envelope '{name}' accepted")
             logger.info(f"           {fmt % 'id'}")
             envelope = fmt
             break
-        logger.debug(f"  envelope '{name}': accepted but no 'id' in the response")
+        # Accepted, but we did not find records where we expected them. Never
+        # discard this quietly -- it may be the winning shape with a payload
+        # wrapper we have not seen.
+        unrecognized.append((name, json.dumps(raw, default=str)[:400]))
+        logger.warning(f"  envelope '{name}' was ACCEPTED but the payload had no "
+                       f"'id' record: {json.dumps(raw, default=str)[:400]}")
 
     if envelope is None:
-        logger.error(f"DISCOVERY FAILED: none of {tried} optionalParam shapes accepted "
-                     f"the single field 'id'. Re-run with GEOTAB_DEBUG=1 to see every "
-                     f"rejection -- the error text names what the schema wants.")
+        # Report everything, unconditionally. Requiring a debug flag to see why
+        # discovery failed just costs another round trip.
+        logger.error(f"DISCOVERY FAILED: none of {tried} optionalParam shapes returned "
+                     f"an 'id'. Distinct errors, most common first:")
+        for msg, labels in sorted(errors.items(), key=lambda kv: -len(kv[1]))[:10]:
+            logger.error(f"  [{len(labels)} shape(s)] {msg}")
+            logger.error(f"      example shape: {labels[0]}")
+        for name, snippet in unrecognized[:5]:
+            logger.error(f"  ACCEPTED but unrecognized payload -- {name}: {snippet}")
+        _run_introspection(base)
+        _probe_alternate_methods(base)
         _field_param = None
         _missing_required = REQUIRED_NESTED
         return None
@@ -344,6 +443,10 @@ def discover_field_selection(base):
 
     _field_param = envelope % " ".join(accepted)
     _missing_required = tuple(f for f in REQUIRED_NESTED if f in rejected)
+    missing_optional = tuple(f for f in OPTIONAL_NESTED if f in rejected)
+    if missing_optional:
+        logger.info(f"Non-blocking fields unavailable: {missing_optional} "
+                    f"(reconcile_databases sources the database independently)")
 
     logger.info(f"DISCOVERY: accepted {len(accepted)} field(s); "
                 f"dropped {rejected or 'none'}")
