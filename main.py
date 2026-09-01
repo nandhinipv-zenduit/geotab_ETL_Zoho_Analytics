@@ -34,6 +34,7 @@ GEOTAB_FIELD_SELECTION) to skip the probing on every run.
 import json
 import logging
 import os
+import re
 import smtplib
 import traceback
 from datetime import datetime, timezone
@@ -190,12 +191,34 @@ OPTIONAL_NESTED = ("latestDeviceDatabase",)
 # accepted argument set is documented anywhere public, so both are discovered:
 # every root name x argument set x wrapper is tried until one accepts `id`.
 GQL_ROOTS = (
+    # Run #679: deviceContracts and getDeviceContracts both reached
+    # "InvalidOperationException: Operation is not valid due to the current state
+    # of the object" rather than "forAccount not provided!" -- so the argument
+    # list WAS read and the failure moved past it. That strongly suggests the
+    # arguments are right and only the root field name is wrong, so this list is
+    # the axis to widen.
     "deviceContracts",
     "getDeviceContracts",
     "GetDeviceContracts",
     "deviceContract",
     "apiDeviceContract",
     "apiDeviceContracts",
+    "apiDeviceContractList",
+    "deviceContractList",
+    "contracts",
+    "devices",
+    "data",
+    "result",
+    "items",
+    "query",
+)
+
+# The InvalidOperationException may also mean the document needs to be a NAMED
+# operation, so try that as a separate axis rather than assuming.
+OPERATION_WRAPPERS = (
+    ("plain", "{ %s }"),
+    ("query", "query { %s }"),
+    ("named", "query GetDeviceContracts { %s }"),
 )
 
 # Widest first: if the schema accepts all five it is the closest match to what
@@ -225,8 +248,8 @@ def _envelope_candidates(base):
             if not args:
                 continue
             body = f"{root}({args}) {{ %s }}"
-            yield f"{root}({'+'.join(keys)})", "{ " + body + " }"
-            yield f"{root}({'+'.join(keys)}) in query", "query { " + body + " }"
+            for wrap_label, wrap in OPERATION_WRAPPERS:
+                yield f"{root}({'+'.join(keys)}) [{wrap_label}]", wrap % body
     for label, fmt in BARE_ENVELOPES:
         yield f"bare:{label}", fmt
 
@@ -294,10 +317,19 @@ def _try_selection(base, optional_param):
     return _as_records(_try_selection_raw(base, optional_param))
 
 
+REF_ID_RE = re.compile(r"\s*\(Ref ID: [0-9a-fA-F-]+\)")
+
+
 def _err_text(e):
     """Flatten a MyAdmin JSON-RPC error into its innermost messages, which is
     where the useful text lives ('forAccount not provided!' was nested two levels
-    down inside 'errors')."""
+    down inside 'errors').
+
+    The Ref ID is stripped. It is unique per call, so leaving it in made every
+    error text distinct and the dedup in the failure report collapsed nothing --
+    which is why run #679 showed only the first 10 of 39 shapes and none of the
+    later root names. Diagnostics that silently drop 3/4 of the evidence are
+    worse than none."""
     payload = e.args[0] if e.args else str(e)
     if isinstance(payload, dict):
         parts = [str(payload.get("message", "")).strip()]
@@ -306,8 +338,8 @@ def _err_text(e):
                 msg = str(sub.get("message", "")).strip()
                 if msg and msg not in parts:
                     parts.append(msg)
-        return " | ".join(p for p in parts if p)[:600]
-    return str(payload)[:600]
+        return REF_ID_RE.sub("", " | ".join(p for p in parts if p))[:600]
+    return REF_ID_RE.sub("", str(payload))[:600]
 
 
 # GraphQL servers usually answer introspection, and one successful introspection
@@ -413,10 +445,11 @@ def discover_field_selection(base):
         # Report everything, unconditionally. Requiring a debug flag to see why
         # discovery failed just costs another round trip.
         logger.error(f"DISCOVERY FAILED: none of {tried} optionalParam shapes returned "
-                     f"an 'id'. Distinct errors, most common first:")
-        for msg, labels in sorted(errors.items(), key=lambda kv: -len(kv[1]))[:10]:
-            logger.error(f"  [{len(labels)} shape(s)] {msg}")
-            logger.error(f"      example shape: {labels[0]}")
+                     f"an 'id'. {len(errors)} distinct error(s), most common first:")
+        for msg, labels in sorted(errors.items(), key=lambda kv: -len(kv[1])):
+            logger.error(f"  [{len(labels)} of {tried} shape(s)] {msg}")
+            logger.error(f"      shapes: {', '.join(labels[:6])}"
+                         f"{' ...' if len(labels) > 6 else ''}")
         for name, snippet in unrecognized[:5]:
             logger.error(f"  ACCEPTED but unrecognized payload -- {name}: {snippet}")
         _run_introspection(base)
