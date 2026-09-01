@@ -355,7 +355,14 @@ INTROSPECTION_PROBES = (
 )
 
 
-ALTERNATE_METHODS = ("GetDeviceContractsByPage", "GetPartnerDeviceContractsAsync")
+ALTERNATE_METHODS = (
+    "GetDeviceContractsByPage",
+    "GetPartnerDeviceContractsAsync",
+    "GetDevicePlans",
+    "GetRatePlans",
+    "GetDeviceContractRatePlans",
+    "GetDeviceContractTransactions",
+)
 
 
 def _probe_alternate_methods(base):
