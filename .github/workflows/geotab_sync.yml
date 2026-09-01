@@ -6,20 +6,23 @@ concurrency:
 
 on:
   schedule:
-    - cron: "0 15 * * *"  # 10 AM EST
-    - cron: "0 18 * * *"  # +3 hours
+    - cron: "0 15 * * *" # 10 AM EST
+    - cron: "0 18 * * *"
     - cron: "0 21 * * *"
     - cron: "0 0 * * *"
     - cron: "0 3 * * *"
     - cron: "0 6 * * *"
     - cron: "0 9 * * *"
-
   workflow_dispatch:
+    inputs:
+      script:
+        description: "Script to run (use probe.py to diagnose without touching Zoho)"
+        default: "main.py"
+        required: false
 
 jobs:
   run-etl:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -28,6 +31,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+          cache: pip
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -36,16 +40,38 @@ jobs:
         env:
           GEOTAB_USERNAME: ${{ secrets.GEOTAB_USERNAME }}
           GEOTAB_PASSWORD: ${{ secrets.GEOTAB_PASSWORD }}
-
           ZOHO_CLIENT_ID_UNI: ${{ secrets.ZOHO_CLIENT_ID_UNI }}
           ZOHO_CLIENT_SECRET_UNI: ${{ secrets.ZOHO_CLIENT_SECRET_UNI }}
           ZOHO_REFRESH_TOKEN_UNI: ${{ secrets.ZOHO_REFRESH_TOKEN_UNI }}
-
-        run: python main.py
+          # ADDED: this was never passed, so send_failure_email() could never send
+          # anything -- login() raised and the error was swallowed by the caller.
+          gmail_pass: ${{ secrets.GMAIL_PASS }}
+          # ADDED: safety floor. Set this repo variable to ~90% of your real device
+          # count after the first good run; below it, the script refuses to
+          # truncate-add rather than replacing the table with a short pull.
+          GEOTAB_MIN_ROWS: ${{ vars.GEOTAB_MIN_ROWS }}
+          # OPTIONAL: once the DISCOVERY log lines tell you which dialects work,
+          # pin them here to skip the per-run probing.
+          # Pagination is now the documented v3 contract, not a guess: perPage
+          # max is 100. Lower it only if you hit rate limits.
+          GEOTAB_PER_PAGE: ${{ vars.GEOTAB_PER_PAGE }}
+          # optionalParam discovery is OFF by default -- v3 does not return the
+          # plan/contract-date fields at all. Set to 1 to re-probe (~30s) if
+          # Geotab documents a working value.
+          GEOTAB_DISCOVER_FIELDS: ${{ vars.GEOTAB_DISCOVER_FIELDS }}
+          # A known-good optionalParam string, once Geotab supplies one.
+          GEOTAB_FIELD_SELECTION: ${{ vars.GEOTAB_FIELD_SELECTION }}
+          # Set to 1 to ABORT rather than sync while those columns load empty.
+          GEOTAB_REQUIRE_FIELDS: ${{ vars.GEOTAB_REQUIRE_FIELDS }}
+          GEOTAB_DEBUG: ${{ vars.GEOTAB_DEBUG }}
+        run: python ${{ github.event.inputs.script || 'main.py' }}
 
       - name: Upload logs (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: geotab-etl-logs
-          path: logs/
+          name: geotab-etl-logs-${{ github.run_number }}
+          path: |
+            logs/
+            gofleet_devices_full.csv
+          if-no-files-found: warn
